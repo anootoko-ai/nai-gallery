@@ -21,7 +21,9 @@ tauri-plugin-process = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "rayon"] }
+# webp included because "png" files saved from browsers/Discord are sometimes
+# really webp; the viewer webview renders them but the thumbnailer must decode them
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "rayon"] }
 walkdir = "2"
 notify = "8"
 notify-debouncer-mini = "0.6"

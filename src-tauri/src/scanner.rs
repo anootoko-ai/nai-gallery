@@ -44,18 +44,31 @@ fn file_mtime_secs(md: &std::fs::Metadata) -> i64 {
         .unwrap_or(0)
 }
 
-/// Generate a thumbnail if missing. Returns true on success.
-fn ensure_thumbnail(data: &[u8], thumb_path: &Path) -> bool {
-    if thumb_path.exists() {
-        return true;
-    }
+/// Read image dimensions from the header without decoding pixel data.
+/// Sniffs the real format, so it works for misnamed files (e.g. a JPEG
+/// saved as .png) that fail the PNG signature check in `nai::parse`.
+fn probe_dimensions(data: &[u8]) -> Option<(u32, u32)> {
+    image::ImageReader::new(std::io::Cursor::new(data))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()
+}
+
+/// Generate a thumbnail, overwriting any stale one. Writes to a temp file
+/// and renames so a crash mid-write can't leave a truncated JPEG that would
+/// be mistaken for a valid cached thumbnail. Returns true on success.
+fn generate_thumbnail(data: &[u8], thumb_path: &Path) -> bool {
     let Ok(img) = image::load_from_memory(data) else {
         return false;
     };
     let thumb = img.thumbnail(THUMB_MAX_DIM, THUMB_MAX_DIM).into_rgb8();
-    thumb
-        .save_with_format(thumb_path, image::ImageFormat::Jpeg)
-        .is_ok()
+    let tmp = thumb_path.with_extension("jpg.tmp");
+    if thumb.save_with_format(&tmp, image::ImageFormat::Jpeg).is_err() {
+        std::fs::remove_file(&tmp).ok();
+        return false;
+    }
+    std::fs::rename(&tmp, thumb_path).is_ok()
 }
 
 /// Scan one folder root. Skips files already indexed with unchanged
@@ -64,15 +77,15 @@ pub fn scan_folder(app: &AppHandle, folder_id: i64, root: &str) -> Result<usize,
     let db = app.state::<Db>();
     let thumbs = thumbs_dir(app);
 
-    // snapshot of already-indexed files -> (size, mtime)
-    let known: std::collections::HashMap<String, (i64, i64)> = {
+    // snapshot of already-indexed files -> (size, mtime, width)
+    let known: std::collections::HashMap<String, (i64, i64, i64)> = {
         let conn = db.0.lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT path, file_size, file_mtime FROM images WHERE folder_id = ?1")
+            .prepare("SELECT path, file_size, file_mtime, width FROM images WHERE folder_id = ?1")
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map([folder_id], |r| {
-                Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?)))
+                Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?, r.get(3)?)))
             })
             .map_err(|e| e.to_string())?
             .filter_map(Result::ok)
@@ -98,7 +111,12 @@ pub fn scan_folder(app: &AppHandle, folder_id: i64, root: &str) -> Result<usize,
         let path = entry.path().to_string_lossy().into_owned();
         let (size, mtime) = (md.len() as i64, file_mtime_secs(&md));
         seen.insert(path.clone());
-        if known.get(&path) != Some(&(size, mtime)) {
+        // width = 0 means an earlier scan failed to read dimensions;
+        // re-index those files so they get healed
+        let unchanged = known
+            .get(&path)
+            .is_some_and(|&(s, m, w)| (s, m) == (size, mtime) && w > 0);
+        if !unchanged {
             pending.push((path, size, mtime));
         }
     }
@@ -120,7 +138,17 @@ pub fn scan_folder(app: &AppHandle, folder_id: i64, root: &str) -> Result<usize,
         .par_iter()
         .filter_map(|(path, size, mtime)| {
             let data = std::fs::read(path).ok()?;
-            let meta = nai::parse(&data);
+            let mut meta = nai::parse(&data);
+            // nai::parse only understands real PNGs; fall back to a format-
+            // sniffing header probe so misnamed JPEGs/WebPs still get real
+            // dimensions instead of 0x0 (which renders as a square tile)
+            if meta.as_ref().is_none_or(|m| m.width == 0 || m.height == 0) {
+                if let Some((w, h)) = probe_dimensions(&data) {
+                    let m = meta.get_or_insert_with(Default::default);
+                    m.width = w;
+                    m.height = h;
+                }
+            }
             let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
             if done % 25 == 0 || done == total {
                 app.emit(
@@ -171,13 +199,90 @@ pub fn scan_folder(app: &AppHandle, folder_id: i64, root: &str) -> Result<usize,
             })
             .collect()
     };
+    // regenerate unconditionally: a cached thumb for a (re)scanned file is
+    // stale by definition — ids can be reused after folder removal, so the
+    // file on disk may belong to a different image entirely
     ids.par_iter().for_each(|(id, i)| {
         let thumb_path = thumbs.join(format!("{id}.jpg"));
-        ensure_thumbnail(&parsed[*i].1, &thumb_path);
+        generate_thumbnail(&parsed[*i].1, &thumb_path);
+    });
+
+    // repair pass: images indexed but missing their thumbnail, e.g. when a
+    // previous scan crashed after the DB commit but before thumbnails finished
+    let missing: Vec<(i64, String)> = {
+        let conn = db.0.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT id, path FROM images WHERE folder_id = ?1")
+            .map_err(|e| e.to_string())?;
+        let rows: Vec<(i64, String)> = stmt
+            .query_map([folder_id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+            .map_err(|e| e.to_string())?
+            .filter_map(Result::ok)
+            .filter(|(id, _)| !thumbs.join(format!("{id}.jpg")).exists())
+            .collect();
+        rows
+    };
+    missing.par_iter().for_each(|(id, path)| {
+        if let Ok(data) = std::fs::read(path) {
+            generate_thumbnail(&data, &thumbs.join(format!("{id}.jpg")));
+        }
     });
 
     app.emit("scan:done", total).ok();
     Ok(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn encode(w: u32, h: u32, format: image::ImageFormat) -> Vec<u8> {
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::new(w, h));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, format).unwrap();
+        buf.into_inner()
+    }
+
+    #[test]
+    fn probe_reads_dims_of_misnamed_formats() {
+        // a JPEG or WebP saved with a .png extension fails nai::parse's
+        // signature check but must still yield real dimensions
+        let jpg = encode(30, 60, image::ImageFormat::Jpeg);
+        assert!(nai::parse(&jpg).is_none());
+        assert_eq!(probe_dimensions(&jpg), Some((30, 60)));
+
+        let webp = encode(40, 20, image::ImageFormat::WebP);
+        assert!(nai::parse(&webp).is_none());
+        assert_eq!(probe_dimensions(&webp), Some((40, 20)));
+    }
+
+    #[test]
+    fn thumbnail_overwrites_corrupt_leftover() {
+        let dir = std::env::temp_dir().join("nai-gallery-test-thumbs");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("1.jpg");
+        // simulate a truncated thumb left behind by a crash mid-write
+        std::fs::write(&path, b"not a jpeg").unwrap();
+
+        let src = encode(100, 200, image::ImageFormat::Png);
+        assert!(generate_thumbnail(&src, &path));
+        let thumb = image::load_from_memory(&std::fs::read(&path).unwrap()).unwrap();
+        // valid jpeg, 1:2 aspect ratio preserved within the 512 bound, no stale tmp file
+        assert_eq!(thumb.height(), thumb.width() * 2);
+        assert!(thumb.width().max(thumb.height()) <= THUMB_MAX_DIM);
+        assert!(!path.with_extension("jpg.tmp").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn thumbnail_decodes_webp_sources() {
+        let dir = std::env::temp_dir().join("nai-gallery-test-thumbs-webp");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("2.jpg");
+        let src = encode(64, 32, image::ImageFormat::WebP);
+        assert!(generate_thumbnail(&src, &path));
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
 
 fn insert_image(conn: &rusqlite::Connection, folder_id: i64, f: &ParsedFile) -> rusqlite::Result<()> {

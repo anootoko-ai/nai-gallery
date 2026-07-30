@@ -84,12 +84,29 @@ fn add_folder(app: AppHandle, db: State<Db>, path: String) -> Result<i64, String
 
 #[tauri::command]
 fn remove_folder(app: AppHandle, db: State<Db>, id: i64) -> Result<(), String> {
-    {
+    // collect image ids first so their cached thumbnails can be deleted too —
+    // sqlite reuses rowids, so leftover thumbs would show up attached to
+    // unrelated images if the folder is re-added later
+    let image_ids: Vec<i64> = {
         let conn = db.0.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT id FROM images WHERE folder_id = ?1")
+            .map_err(|e| e.to_string())?;
+        let ids: Vec<i64> = stmt
+            .query_map([id], |r| r.get(0))
+            .map_err(|e| e.to_string())?
+            .filter_map(Result::ok)
+            .collect();
+        drop(stmt);
         conn.execute("DELETE FROM images WHERE folder_id = ?1", [id])
             .map_err(|e| e.to_string())?;
         conn.execute("DELETE FROM folders WHERE id = ?1", [id])
             .map_err(|e| e.to_string())?;
+        ids
+    };
+    let thumbs = scanner::thumbs_dir(&app);
+    for image_id in image_ids {
+        std::fs::remove_file(thumbs.join(format!("{image_id}.jpg"))).ok();
     }
     app.state::<Watchers>().0.lock().unwrap().remove(&id);
     Ok(())
@@ -273,9 +290,15 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         // thumb://<id>  → cached thumbnail jpeg
         .register_uri_scheme_protocol("thumb", |ctx, request| {
-            let id = request.uri().path().trim_start_matches('/').trim_end_matches(".jpg").to_string();
+            let id: Result<i64, String> = request
+                .uri()
+                .path()
+                .trim_start_matches('/')
+                .trim_end_matches(".jpg")
+                .parse()
+                .map_err(|_| "bad id".to_string());
             let dir = scanner::thumbs_dir(ctx.app_handle());
-            serve_image(Ok(dir.join(format!("{id}.jpg"))))
+            serve_image(id.map(|id| dir.join(format!("{id}.jpg"))))
         })
         // orig://<id>  → full-resolution original from its indexed path
         .register_uri_scheme_protocol("orig", |ctx, request| {
@@ -297,6 +320,18 @@ pub fn run() {
             let db = db::open(&data_dir)?;
             app.manage(db);
             app.manage(Watchers(Mutex::new(HashMap::new())));
+
+            // one-time cache reset: builds before the .v2 marker could leave
+            // truncated thumbnails (non-atomic writes) or thumbs attached to
+            // the wrong image (rowid reuse). The startup rescan's repair pass
+            // regenerates everything that's missing.
+            let thumbs = scanner::thumbs_dir(app.handle());
+            let marker = thumbs.join(".v2");
+            if !marker.exists() {
+                std::fs::remove_dir_all(&thumbs).ok();
+                std::fs::create_dir_all(&thumbs).ok();
+                std::fs::write(&marker, b"").ok();
+            }
 
             // start watchers + a background incremental rescan of all folders
             let handle = app.handle().clone();
