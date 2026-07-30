@@ -56,6 +56,19 @@ export interface LibraryStats {
   total: number;
   novelai: number;
   favorites: number;
+  rejects: number;
+}
+
+export interface AlbumInfo {
+  id: number;
+  name: string;
+  image_count: number;
+}
+
+export interface SavedSearch {
+  id: number;
+  name: string;
+  query_json: string;
 }
 
 export interface Query {
@@ -65,6 +78,8 @@ export interface Query {
   favorite?: boolean;
   min_rating?: number;
   folder_id?: number;
+  album_id?: number;
+  rejects?: boolean;
   sort: string;
   offset: number;
   limit: number;
@@ -90,3 +105,24 @@ export const removeFolder = (id: number) => invoke<void>("remove_folder", { id }
 export const rescanAll = () => invoke<void>("rescan_all");
 export const openInExplorer = (path: string) =>
   invoke<void>("open_in_explorer", { path });
+
+// ── phase 2 ──
+export const setHiddenBulk = (ids: number[], hidden: boolean) =>
+  invoke<void>("set_hidden_bulk", { ids, hidden });
+export const setFavoriteBulk = (ids: number[], favorite: boolean) =>
+  invoke<void>("set_favorite_bulk", { ids, favorite });
+export const setRatingBulk = (ids: number[], rating: number) =>
+  invoke<void>("set_rating_bulk", { ids, rating });
+export const listAlbums = () => invoke<AlbumInfo[]>("list_albums");
+export const createAlbum = (name: string) => invoke<number>("create_album", { name });
+export const deleteAlbum = (id: number) => invoke<void>("delete_album", { id });
+export const addToAlbum = (albumId: number, ids: number[]) =>
+  invoke<void>("add_to_album", { albumId, ids });
+export const removeFromAlbum = (albumId: number, ids: number[]) =>
+  invoke<void>("remove_from_album", { albumId, ids });
+export const listSavedSearches = () => invoke<SavedSearch[]>("list_saved_searches");
+export const createSavedSearch = (name: string, queryJson: string) =>
+  invoke<number>("create_saved_search", { name, queryJson });
+export const deleteSavedSearch = (id: number) =>
+  invoke<void>("delete_saved_search", { id });
+export const trashImages = (ids: number[]) => invoke<number>("trash_images", { ids });

@@ -43,6 +43,22 @@ CREATE TABLE IF NOT EXISTS image_tags(
   PRIMARY KEY(image_id, tag_id)
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS idx_image_tags_tag ON image_tags(tag_id);
+CREATE TABLE IF NOT EXISTS albums(
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  position INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS album_images(
+  album_id INTEGER NOT NULL REFERENCES albums(id) ON DELETE CASCADE,
+  image_id INTEGER NOT NULL REFERENCES images(id) ON DELETE CASCADE,
+  position INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(album_id, image_id)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS saved_searches(
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  query_json TEXT NOT NULL
+);
 ";
 
 pub fn open(app_data_dir: &Path) -> rusqlite::Result<Db> {
@@ -66,6 +82,10 @@ pub struct Query {
     pub favorite: Option<bool>,
     pub min_rating: Option<i64>,
     pub folder_id: Option<i64>,
+    pub album_id: Option<i64>,
+    /// false (default) = hide rejects; true = show ONLY rejects
+    #[serde(default)]
+    pub rejects: bool,
     #[serde(default)]
     pub sort: String, // "newest" | "oldest" | "rating"
     #[serde(default)]
@@ -140,6 +160,21 @@ pub struct LibraryStats {
     pub total: i64,
     pub novelai: i64,
     pub favorites: i64,
+    pub rejects: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AlbumInfo {
+    pub id: i64,
+    pub name: String,
+    pub image_count: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SavedSearch {
+    pub id: i64,
+    pub name: String,
+    pub query_json: String,
 }
 
 // ── queries ──────────────────────────────────────────────────
@@ -147,7 +182,16 @@ pub struct LibraryStats {
 /// Build WHERE clause + params for a Query. Tag filters use
 /// group-by-count intersection (danbooru AND semantics).
 fn build_where(q: &Query, params_out: &mut Vec<Box<dyn rusqlite::ToSql>>) -> String {
-    let mut clauses = vec!["images.hidden = 0".to_string()];
+    let mut clauses = vec![if q.rejects {
+        "images.hidden = 1".to_string()
+    } else {
+        "images.hidden = 0".to_string()
+    }];
+    if let Some(a) = q.album_id {
+        clauses.push(format!(
+            "images.id IN (SELECT image_id FROM album_images WHERE album_id = {a})"
+        ));
+    }
 
     if !q.include_tags.is_empty() {
         let ph = q.include_tags.iter().map(|_| "?").collect::<Vec<_>>().join(",");
@@ -339,14 +383,138 @@ pub fn list_folders(conn: &Connection) -> rusqlite::Result<Vec<FolderInfo>> {
 
 pub fn stats(conn: &Connection) -> rusqlite::Result<LibraryStats> {
     conn.query_row(
-        "SELECT COUNT(*), COALESCE(SUM(is_novelai),0), COALESCE(SUM(favorite),0) FROM images WHERE hidden = 0",
+        "SELECT COALESCE(SUM(hidden = 0),0), COALESCE(SUM(is_novelai AND hidden = 0),0),
+                COALESCE(SUM(favorite AND hidden = 0),0), COALESCE(SUM(hidden),0)
+         FROM images",
         [],
         |r| {
             Ok(LibraryStats {
                 total: r.get(0)?,
                 novelai: r.get(1)?,
                 favorites: r.get(2)?,
+                rejects: r.get(3)?,
             })
         },
     )
+}
+
+// ── phase 2: bulk ops, albums, saved searches ───────────────
+
+pub fn set_hidden_bulk(conn: &Connection, ids: &[i64], hidden: bool) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare("UPDATE images SET hidden = ?2 WHERE id = ?1")?;
+    for id in ids {
+        stmt.execute(params![id, hidden as i64])?;
+    }
+    Ok(())
+}
+
+pub fn set_favorite_bulk(conn: &Connection, ids: &[i64], favorite: bool) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare("UPDATE images SET favorite = ?2 WHERE id = ?1")?;
+    for id in ids {
+        stmt.execute(params![id, favorite as i64])?;
+    }
+    Ok(())
+}
+
+pub fn set_rating_bulk(conn: &Connection, ids: &[i64], rating: i64) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare("UPDATE images SET rating = ?2 WHERE id = ?1")?;
+    for id in ids {
+        stmt.execute(params![id, rating.clamp(0, 5)])?;
+    }
+    Ok(())
+}
+
+pub fn list_albums(conn: &Connection) -> rusqlite::Result<Vec<AlbumInfo>> {
+    let mut stmt = conn.prepare(
+        "SELECT a.id, a.name, COUNT(ai.image_id) FROM albums a
+         LEFT JOIN album_images ai ON ai.album_id = a.id
+         GROUP BY a.id ORDER BY a.position, a.name",
+    )?;
+    let albums = stmt
+        .query_map([], |r| {
+            Ok(AlbumInfo {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                image_count: r.get(2)?,
+            })
+        })?
+        .collect();
+    albums
+}
+
+pub fn create_album(conn: &Connection, name: &str) -> rusqlite::Result<i64> {
+    conn.execute("INSERT INTO albums(name) VALUES (?1)", params![name])?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn delete_album(conn: &Connection, id: i64) -> rusqlite::Result<()> {
+    conn.execute("DELETE FROM albums WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+pub fn add_to_album(conn: &Connection, album_id: i64, ids: &[i64]) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare(
+        "INSERT OR IGNORE INTO album_images(album_id, image_id, position)
+         VALUES (?1, ?2, (SELECT COALESCE(MAX(position),0)+1 FROM album_images WHERE album_id = ?1))",
+    )?;
+    for id in ids {
+        stmt.execute(params![album_id, id])?;
+    }
+    Ok(())
+}
+
+pub fn remove_from_album(conn: &Connection, album_id: i64, ids: &[i64]) -> rusqlite::Result<()> {
+    let mut stmt =
+        conn.prepare("DELETE FROM album_images WHERE album_id = ?1 AND image_id = ?2")?;
+    for id in ids {
+        stmt.execute(params![album_id, id])?;
+    }
+    Ok(())
+}
+
+pub fn list_saved_searches(conn: &Connection) -> rusqlite::Result<Vec<SavedSearch>> {
+    let mut stmt = conn.prepare("SELECT id, name, query_json FROM saved_searches ORDER BY name")?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(SavedSearch {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                query_json: r.get(2)?,
+            })
+        })?
+        .collect();
+    rows
+}
+
+pub fn create_saved_search(conn: &Connection, name: &str, query_json: &str) -> rusqlite::Result<i64> {
+    conn.execute(
+        "INSERT INTO saved_searches(name, query_json) VALUES (?1, ?2)",
+        params![name, query_json],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn delete_saved_search(conn: &Connection, id: i64) -> rusqlite::Result<()> {
+    conn.execute("DELETE FROM saved_searches WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+/// Remove images from the index (rows + thumbs are handled by caller for files).
+pub fn get_paths_for_ids(conn: &Connection, ids: &[i64]) -> rusqlite::Result<Vec<(i64, String)>> {
+    let mut stmt = conn.prepare("SELECT id, path FROM images WHERE id = ?1")?;
+    let mut out = Vec::new();
+    for id in ids {
+        if let Ok(row) = stmt.query_row(params![id], |r| Ok((r.get(0)?, r.get(1)?))) {
+            out.push(row);
+        }
+    }
+    Ok(out)
+}
+
+pub fn delete_images(conn: &Connection, ids: &[i64]) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare("DELETE FROM images WHERE id = ?1")?;
+    for id in ids {
+        stmt.execute(params![id])?;
+    }
+    Ok(())
 }

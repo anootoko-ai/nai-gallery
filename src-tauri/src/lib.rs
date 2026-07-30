@@ -114,6 +114,97 @@ fn rescan_all(app: AppHandle, db: State<Db>) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn set_hidden_bulk(db: State<Db>, ids: Vec<i64>, hidden: bool) -> Result<(), String> {
+    let conn = db.0.lock().unwrap();
+    db::set_hidden_bulk(&conn, &ids, hidden).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_favorite_bulk(db: State<Db>, ids: Vec<i64>, favorite: bool) -> Result<(), String> {
+    let conn = db.0.lock().unwrap();
+    db::set_favorite_bulk(&conn, &ids, favorite).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_rating_bulk(db: State<Db>, ids: Vec<i64>, rating: i64) -> Result<(), String> {
+    let conn = db.0.lock().unwrap();
+    db::set_rating_bulk(&conn, &ids, rating).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn list_albums(db: State<Db>) -> Result<Vec<db::AlbumInfo>, String> {
+    let conn = db.0.lock().unwrap();
+    db::list_albums(&conn).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn create_album(db: State<Db>, name: String) -> Result<i64, String> {
+    let conn = db.0.lock().unwrap();
+    db::create_album(&conn, &name).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn delete_album(db: State<Db>, id: i64) -> Result<(), String> {
+    let conn = db.0.lock().unwrap();
+    db::delete_album(&conn, id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn add_to_album(db: State<Db>, album_id: i64, ids: Vec<i64>) -> Result<(), String> {
+    let conn = db.0.lock().unwrap();
+    db::add_to_album(&conn, album_id, &ids).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn remove_from_album(db: State<Db>, album_id: i64, ids: Vec<i64>) -> Result<(), String> {
+    let conn = db.0.lock().unwrap();
+    db::remove_from_album(&conn, album_id, &ids).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn list_saved_searches(db: State<Db>) -> Result<Vec<db::SavedSearch>, String> {
+    let conn = db.0.lock().unwrap();
+    db::list_saved_searches(&conn).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn create_saved_search(db: State<Db>, name: String, query_json: String) -> Result<i64, String> {
+    let conn = db.0.lock().unwrap();
+    db::create_saved_search(&conn, &name, &query_json).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn delete_saved_search(db: State<Db>, id: i64) -> Result<(), String> {
+    let conn = db.0.lock().unwrap();
+    db::delete_saved_search(&conn, id).map_err(|e| e.to_string())
+}
+
+/// Move files to the OS recycle bin and drop them from the index.
+/// The ONLY file-modifying operation in the app; triggered explicitly by the user.
+#[tauri::command]
+fn trash_images(app: AppHandle, db: State<Db>, ids: Vec<i64>) -> Result<usize, String> {
+    let paths = {
+        let conn = db.0.lock().unwrap();
+        db::get_paths_for_ids(&conn, &ids).map_err(|e| e.to_string())?
+    };
+    let existing: Vec<&String> = paths
+        .iter()
+        .map(|(_, p)| p)
+        .filter(|p| std::path::Path::new(p.as_str()).exists())
+        .collect();
+    trash::delete_all(&existing).map_err(|e| e.to_string())?;
+    {
+        let conn = db.0.lock().unwrap();
+        db::delete_images(&conn, &ids).map_err(|e| e.to_string())?;
+    }
+    let thumbs = scanner::thumbs_dir(&app);
+    for (id, _) in &paths {
+        std::fs::remove_file(thumbs.join(format!("{id}.jpg"))).ok();
+    }
+    Ok(existing.len())
+}
+
+#[tauri::command]
 fn open_in_explorer(path: String) -> Result<(), String> {
     std::process::Command::new("explorer")
         .args(["/select,", &path])
@@ -237,7 +328,19 @@ pub fn run() {
             add_folder,
             remove_folder,
             rescan_all,
-            open_in_explorer
+            open_in_explorer,
+            set_hidden_bulk,
+            set_favorite_bulk,
+            set_rating_bulk,
+            list_albums,
+            create_album,
+            delete_album,
+            add_to_album,
+            remove_from_album,
+            list_saved_searches,
+            create_saved_search,
+            delete_saved_search,
+            trash_images
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
