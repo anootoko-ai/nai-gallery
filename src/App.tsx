@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { open as openDialog, confirm as confirmDialog } from "@tauri-apps/plugin-dialog";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import * as api from "./api";
@@ -11,48 +11,86 @@ interface Filter {
   neg: boolean;
 }
 
-type View = "all" | "favorites";
+/// What the grid is showing. One value instead of parallel view/folder/album
+/// states that would have to be reset in lockstep.
+type Scope =
+  | { kind: "all" }
+  | { kind: "favorites" }
+  | { kind: "rejects" }
+  | { kind: "folder"; id: number }
+  | { kind: "album"; id: number };
+
+interface SavedQuery {
+  filters: Filter[];
+  scope: Scope;
+  sort: string;
+}
+
+interface NamePrompt {
+  title: string;
+  placeholder?: string;
+  initial?: string;
+  onSubmit: (value: string) => void;
+}
+
+interface Mods {
+  shift: boolean;
+  ctrl: boolean;
+}
 
 const PAGE = 200;
+
+const scopeId = (s: Scope) => ("id" in s ? s.id : null);
+const sameScope = (a: Scope, b: Scope) => a.kind === b.kind && scopeId(a) === scopeId(b);
 
 export default function App() {
   // ── query state ──
   const [filters, setFilters] = useState<Filter[]>([]);
-  const [view, setView] = useState<View>("all");
-  const [folderId, setFolderId] = useState<number | null>(null);
+  const [scope, setScope] = useState<Scope>({ kind: "all" });
   const [sort, setSort] = useState("newest");
   // ── data state ──
   const [cards, setCards] = useState<api.ImageCard[]>([]);
   const [total, setTotal] = useState(0);
   const [folders, setFolders] = useState<api.FolderInfo[]>([]);
+  const [albums, setAlbums] = useState<api.AlbumInfo[]>([]);
+  const [searches, setSearches] = useState<api.SavedSearch[]>([]);
   const [tops, setTops] = useState<api.TagSuggestion[]>([]);
   const [stats, setStats] = useState<api.LibraryStats | null>(null);
   const [scanMsg, setScanMsg] = useState<string | null>(null);
   // ── selection / viewer ──
-  const [selectedId, setSelectedId] = useState<number | null>(null);
+  const [sel, setSel] = useState<Set<number>>(new Set());
+  const [primaryId, setPrimaryId] = useState<number | null>(null);
   const [detail, setDetail] = useState<api.ImageDetail | null>(null);
   const [viewerOpen, setViewerOpen] = useState(false);
   const [thumbWidth, setThumbWidth] = useState(210);
+  const [namePrompt, setNamePrompt] = useState<NamePrompt | null>(null);
   const [update, setUpdate] = useState<Update | null>(null);
   const [updating, setUpdating] = useState(false);
 
+  const anchorRef = useRef<number | null>(null);
   const queryRef = useRef(0);
+
+  const selIds = useMemo(() => [...sel], [sel]);
 
   const buildQuery = useCallback(
     (offset: number): Partial<api.Query> => ({
       include_tags: filters.filter((f) => !f.neg).map((f) => f.tag),
       exclude_tags: filters.filter((f) => f.neg).map((f) => f.tag),
-      favorite: view === "favorites" ? true : undefined,
-      folder_id: folderId ?? undefined,
+      favorite: scope.kind === "favorites" ? true : undefined,
+      folder_id: scope.kind === "folder" ? scope.id : undefined,
+      album_id: scope.kind === "album" ? scope.id : undefined,
+      rejects: scope.kind === "rejects",
       sort,
       offset,
       limit: PAGE,
     }),
-    [filters, view, folderId, sort]
+    [filters, scope, sort]
   );
 
   const refreshMeta = useCallback(() => {
     api.listFolders().then(setFolders).catch(() => {});
+    api.listAlbums().then(setAlbums).catch(() => {});
+    api.listSavedSearches().then(setSearches).catch(() => {});
     api.topTags().then(setTops).catch(() => {});
     api.getStats().then(setStats).catch(() => {});
   }, []);
@@ -78,6 +116,14 @@ export default function App() {
 
   useEffect(runQuery, [runQuery]);
   useEffect(refreshMeta, [refreshMeta]);
+
+  // a new result set invalidates the old selection
+  const clearSel = useCallback(() => {
+    setSel(new Set());
+    setPrimaryId(null);
+    anchorRef.current = null;
+  }, []);
+  useEffect(clearSel, [scope, filters, sort, clearSel]);
 
   // scan events
   useEffect(() => {
@@ -116,14 +162,67 @@ export default function App() {
     }
   }, [update, updating]);
 
-  // selection detail
+  // inspector detail follows the primary (last-clicked) image
   useEffect(() => {
-    if (selectedId == null) {
+    if (primaryId == null) {
       setDetail(null);
       return;
     }
-    api.getImage(selectedId).then(setDetail).catch(() => setDetail(null));
-  }, [selectedId]);
+    api.getImage(primaryId).then(setDetail).catch(() => setDetail(null));
+  }, [primaryId]);
+
+  // ── selection ──
+  const selectCard = useCallback(
+    (id: number, mods: Mods) => {
+      if (mods.shift && anchorRef.current != null) {
+        const a = cards.findIndex((c) => c.id === anchorRef.current);
+        const b = cards.findIndex((c) => c.id === id);
+        if (a >= 0 && b >= 0) {
+          const [lo, hi] = a < b ? [a, b] : [b, a];
+          setSel(new Set(cards.slice(lo, hi + 1).map((c) => c.id)));
+          setPrimaryId(id);
+          return;
+        }
+      }
+      if (mods.ctrl) {
+        setSel((prev) => {
+          const next = new Set(prev);
+          if (next.has(id)) next.delete(id);
+          else next.add(id);
+          return next;
+        });
+      } else {
+        setSel(new Set([id]));
+      }
+      anchorRef.current = id;
+      setPrimaryId(id);
+    },
+    [cards]
+  );
+
+  /// Drop rows that no longer belong to the current result set. Offset-based
+  /// paging stays correct: the removed rows are gone from the query too, so
+  /// the next page still starts at cards.length.
+  const dropCards = useCallback(
+    (ids: number[]) => {
+      const gone = new Set(ids);
+      // count against what's actually on screen — a background rescan can
+      // replace the grid while a selection is still held
+      const removed = cards.reduce((n, c) => (gone.has(c.id) ? n + 1 : n), 0);
+      setCards((cs) => cs.filter((c) => !gone.has(c.id)));
+      setTotal((t) => Math.max(0, t - removed));
+      setPrimaryId((p) => (p != null && gone.has(p) ? null : p));
+      setSel(new Set());
+      anchorRef.current = null;
+    },
+    [cards]
+  );
+
+  const patchCards = useCallback((ids: number[], patch: Partial<api.ImageCard>) => {
+    const hit = new Set(ids);
+    setCards((cs) => cs.map((c) => (hit.has(c.id) ? { ...c, ...patch } : c)));
+    setDetail((d) => (d && hit.has(d.id) ? { ...d, ...patch } : d));
+  }, []);
 
   // ── actions ──
   const addFilter = useCallback((tag: string, neg: boolean) => {
@@ -133,30 +232,124 @@ export default function App() {
   }, []);
   const removeFilter = (i: number) => setFilters((f) => f.filter((_, j) => j !== i));
 
-  const patchCard = useCallback((id: number, patch: Partial<api.ImageCard>) => {
-    setCards((cs) => cs.map((c) => (c.id === id ? { ...c, ...patch } : c)));
-  }, []);
-
-  const toggleFav = useCallback(
-    (id: number, current: boolean) => {
-      api.setFavorite(id, !current).then(() => {
-        patchCard(id, { favorite: !current });
-        setDetail((d) => (d && d.id === id ? { ...d, favorite: !current } : d));
-        api.getStats().then(setStats).catch(() => {});
-      });
+  const favorite = useCallback(
+    async (ids: number[], value: boolean) => {
+      if (!ids.length) return;
+      await api.setFavoriteBulk(ids, value);
+      // un-favoriting inside the Favorites view removes those images from it
+      if (scope.kind === "favorites" && !value) dropCards(ids);
+      else patchCards(ids, { favorite: value });
+      api.getStats().then(setStats).catch(() => {});
     },
-    [patchCard]
+    [scope, dropCards, patchCards]
   );
 
   const rate = useCallback(
-    (id: number, rating: number) => {
-      api.setRating(id, rating).then(() => {
-        patchCard(id, { rating });
-        setDetail((d) => (d && d.id === id ? { ...d, rating } : d));
+    async (ids: number[], rating: number) => {
+      if (!ids.length) return;
+      await api.setRatingBulk(ids, rating);
+      patchCards(ids, { rating });
+    },
+    [patchCards]
+  );
+
+  const setHidden = useCallback(
+    async (ids: number[], hidden: boolean) => {
+      if (!ids.length) return;
+      await api.setHiddenBulk(ids, hidden);
+      dropCards(ids); // leaves the current view either way (reject or restore)
+      api.getStats().then(setStats).catch(() => {});
+    },
+    [dropCards]
+  );
+
+  const trashSelection = useCallback(async () => {
+    const ids = selIds;
+    if (!ids.length) return;
+    const ok = await confirmDialog(
+      `Move ${ids.length} file${ids.length === 1 ? "" : "s"} to the Recycle Bin?\n\n` +
+        `They leave the library and can be restored from the Windows Recycle Bin.`,
+      { title: "Move to Recycle Bin", kind: "warning", okLabel: "Move to Recycle Bin" }
+    );
+    if (!ok) return;
+    await api.trashImages(ids);
+    dropCards(ids);
+    refreshMeta();
+  }, [selIds, dropCards, refreshMeta]);
+
+  const addSelToAlbum = useCallback(
+    async (albumId: number) => {
+      if (!selIds.length) return;
+      await api.addToAlbum(albumId, selIds);
+      api.listAlbums().then(setAlbums).catch(() => {});
+      if (scope.kind === "album" && scope.id === albumId) runQuery();
+    },
+    [selIds, scope, runQuery]
+  );
+
+  const removeSelFromAlbum = useCallback(async () => {
+    if (scope.kind !== "album" || !selIds.length) return;
+    await api.removeFromAlbum(scope.id, selIds);
+    dropCards(selIds);
+    api.listAlbums().then(setAlbums).catch(() => {});
+  }, [scope, selIds, dropCards]);
+
+  const promptNewAlbum = useCallback(
+    (withSelection: boolean) => {
+      const ids = withSelection ? selIds : [];
+      setNamePrompt({
+        title: ids.length ? `New album with ${ids.length} image${ids.length === 1 ? "" : "s"}` : "New album",
+        placeholder: "Album name",
+        onSubmit: async (name) => {
+          const id = await api.createAlbum(name);
+          if (ids.length) await api.addToAlbum(id, ids);
+          api.listAlbums().then(setAlbums).catch(() => {});
+        },
       });
     },
-    [patchCard]
+    [selIds]
   );
+
+  const deleteAlbum = useCallback(
+    async (a: api.AlbumInfo) => {
+      const ok = await confirmDialog(
+        `Delete the album “${a.name}”?\n\nThe ${a.image_count} image${
+          a.image_count === 1 ? "" : "s"
+        } stay in your library — only the grouping is removed.`,
+        { title: "Delete album", kind: "warning", okLabel: "Delete album" }
+      );
+      if (!ok) return;
+      await api.deleteAlbum(a.id);
+      setScope((s) => (s.kind === "album" && s.id === a.id ? { kind: "all" } : s));
+      api.listAlbums().then(setAlbums).catch(() => {});
+    },
+    []
+  );
+
+  const saveCurrentSearch = useCallback(() => {
+    const payload: SavedQuery = { filters, scope, sort };
+    setNamePrompt({
+      title: "Save current search",
+      placeholder: "Name",
+      initial: filters.map((f) => (f.neg ? "-" : "") + f.tag).join(" "),
+      onSubmit: async (name) => {
+        await api.createSavedSearch(name, JSON.stringify(payload));
+        api.listSavedSearches().then(setSearches).catch(() => {});
+      },
+    });
+  }, [filters, scope, sort]);
+
+  const applySearch = useCallback((s: api.SavedSearch) => {
+    let q: Partial<SavedQuery>;
+    try {
+      q = JSON.parse(s.query_json);
+    } catch {
+      return; // unreadable entry — leave the current view alone
+    }
+    setFilters(Array.isArray(q.filters) ? q.filters : []);
+    setScope(q.scope && typeof q.scope.kind === "string" ? q.scope : { kind: "all" });
+    setSort(typeof q.sort === "string" ? q.sort : "newest");
+  }, []);
 
   const pickFolder = async () => {
     const dir = await openDialog({ directory: true, multiple: false });
@@ -169,26 +362,67 @@ export default function App() {
   // ── keyboard ──
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if ((e.target as HTMLElement)?.tagName === "INPUT") return;
-      const idx = cards.findIndex((c) => c.id === selectedId);
+      const tag = (e.target as HTMLElement | null)?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA") return;
+      if (namePrompt) return;
+
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "a") {
+        e.preventDefault();
+        setSel(new Set(cards.map((c) => c.id)));
+        return;
+      }
+      // targets: the whole selection when there is one, else the primary
+      const targets = sel.size > 0 ? [...sel] : primaryId != null ? [primaryId] : [];
+      const idx = cards.findIndex((c) => c.id === primaryId);
+
       if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
         e.preventDefault();
-        const next = e.key === "ArrowRight" ? idx + 1 : idx - 1;
-        if (next >= 0 && next < cards.length) setSelectedId(cards[next].id);
+        const next = idx + (e.key === "ArrowRight" ? 1 : -1);
+        if (next >= 0 && next < cards.length) {
+          const id = cards[next].id;
+          setPrimaryId(id);
+          if (e.shiftKey && anchorRef.current != null) {
+            const a = cards.findIndex((c) => c.id === anchorRef.current);
+            const [lo, hi] = a < next ? [a, next] : [next, a];
+            setSel(new Set(cards.slice(lo, hi + 1).map((c) => c.id)));
+          } else {
+            setSel(new Set([id]));
+            anchorRef.current = id;
+          }
+        }
         if (next >= cards.length - 10) loadMore();
       } else if (e.key === "Escape") {
-        setViewerOpen(false);
-      } else if (e.key === "Enter" && selectedId != null) {
+        if (viewerOpen) setViewerOpen(false);
+        else clearSel();
+      } else if (e.key === "Enter" && primaryId != null) {
         setViewerOpen(true);
-      } else if (e.key.toLowerCase() === "f" && selectedId != null && detail) {
-        toggleFav(selectedId, detail.favorite);
-      } else if (/^[0-5]$/.test(e.key) && selectedId != null) {
-        rate(selectedId, Number(e.key));
+      } else if (e.key.toLowerCase() === "f" && targets.length && detail) {
+        // the primary's current state decides the direction for the whole batch
+        favorite(targets, !detail.favorite);
+      } else if (/^[0-5]$/.test(e.key) && targets.length) {
+        rate(targets, Number(e.key));
+      } else if (e.key === "Delete" && targets.length && scope.kind !== "rejects") {
+        // rejecting is reversible; leaving Rejects requires the explicit buttons
+        e.preventDefault();
+        setHidden(targets, true);
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [cards, selectedId, detail, loadMore, toggleFav, rate]);
+  }, [
+    cards,
+    sel,
+    primaryId,
+    detail,
+    viewerOpen,
+    namePrompt,
+    scope,
+    loadMore,
+    favorite,
+    rate,
+    setHidden,
+    clearSel,
+  ]);
 
   return (
     <div className="app">
@@ -202,47 +436,53 @@ export default function App() {
         setThumbWidth={setThumbWidth}
       />
       <Sidebar
-        view={view}
-        setView={(v) => {
-          setView(v);
-          setFolderId(null);
-        }}
+        scope={scope}
+        setScope={setScope}
         stats={stats}
         folders={folders}
-        folderId={folderId}
-        setFolderId={(id) => {
-          setFolderId(id);
-          setView("all");
-        }}
+        albums={albums}
+        searches={searches}
         tops={tops}
         onTag={(t) => addFilter(t, false)}
         onAddFolder={pickFolder}
         onRemoveFolder={async (id) => {
           await api.removeFolder(id);
-          if (folderId === id) setFolderId(null);
+          setScope((s) => (s.kind === "folder" && s.id === id ? { kind: "all" } : s));
           refreshMeta();
           runQuery();
+        }}
+        onNewAlbum={() => promptNewAlbum(false)}
+        onDeleteAlbum={deleteAlbum}
+        onSaveSearch={saveCurrentSearch}
+        onApplySearch={applySearch}
+        onDeleteSearch={async (id) => {
+          await api.deleteSavedSearch(id);
+          api.listSavedSearches().then(setSearches).catch(() => {});
         }}
       />
       <Grid
         cards={cards}
         total={total}
         filters={filters}
-        selectedId={selectedId}
-        onSelect={setSelectedId}
+        scope={scope}
+        sel={sel}
+        primaryId={primaryId}
+        onSelect={selectCard}
         onOpen={(id) => {
-          setSelectedId(id);
+          setSel(new Set([id]));
+          setPrimaryId(id);
+          anchorRef.current = id;
           setViewerOpen(true);
         }}
-        onFav={toggleFav}
+        onFav={(id, current) => favorite([id], !current)}
         onLoadMore={loadMore}
         thumbWidth={thumbWidth}
       />
       <Inspector
         detail={detail}
         onTag={(t) => addFilter(t, false)}
-        onFav={toggleFav}
-        onRate={rate}
+        onFav={(id, current) => favorite([id], !current)}
+        onRate={(id, n) => rate([id], n)}
       />
       <StatusBar
         stats={stats}
@@ -252,19 +492,43 @@ export default function App() {
         updating={updating}
         onInstallUpdate={installUpdate}
       />
+      {sel.size > 0 && (
+        <BulkBar
+          count={sel.size}
+          scope={scope}
+          albums={albums}
+          onClear={clearSel}
+          onFav={(v) => favorite(selIds, v)}
+          onRate={(n) => rate(selIds, n)}
+          onReject={() => setHidden(selIds, true)}
+          onRestore={() => setHidden(selIds, false)}
+          onTrash={trashSelection}
+          onAddToAlbum={addSelToAlbum}
+          onNewAlbum={() => promptNewAlbum(true)}
+          onRemoveFromAlbum={removeSelFromAlbum}
+        />
+      )}
       {viewerOpen && detail && (
         <Viewer
           detail={detail}
           onClose={() => setViewerOpen(false)}
           onNav={(dir) => {
-            const idx = cards.findIndex((c) => c.id === selectedId);
+            const idx = cards.findIndex((c) => c.id === primaryId);
             const next = idx + dir;
-            if (next >= 0 && next < cards.length) setSelectedId(cards[next].id);
+            if (next >= 0 && next < cards.length) {
+              const id = cards[next].id;
+              setPrimaryId(id);
+              setSel(new Set([id]));
+              anchorRef.current = id;
+            }
             if (next >= cards.length - 10) loadMore();
           }}
-          onFav={toggleFav}
-          onRate={rate}
+          onFav={(id, current) => favorite([id], !current)}
+          onRate={(id, n) => rate([id], n)}
         />
+      )}
+      {namePrompt && (
+        <NameModal prompt={namePrompt} onClose={() => setNamePrompt(null)} />
       )}
     </div>
   );
@@ -376,45 +640,111 @@ function TopBar(props: {
 // ── Sidebar ──────────────────────────────────────────────────
 
 function Sidebar(props: {
-  view: View;
-  setView: (v: View) => void;
+  scope: Scope;
+  setScope: (s: Scope) => void;
   stats: api.LibraryStats | null;
   folders: api.FolderInfo[];
-  folderId: number | null;
-  setFolderId: (id: number | null) => void;
+  albums: api.AlbumInfo[];
+  searches: api.SavedSearch[];
   tops: api.TagSuggestion[];
   onTag: (t: string) => void;
   onAddFolder: () => void;
   onRemoveFolder: (id: number) => void;
+  onNewAlbum: () => void;
+  onDeleteAlbum: (a: api.AlbumInfo) => void;
+  onSaveSearch: () => void;
+  onApplySearch: (s: api.SavedSearch) => void;
+  onDeleteSearch: (id: number) => void;
 }) {
+  const is = (s: Scope) => sameScope(props.scope, s);
+
   return (
     <div className="sidebar">
       <div className="side-h">Library</div>
-      <div
-        className={`side-row ${props.view === "all" && props.folderId == null ? "active" : ""}`}
-        onClick={() => {
-          props.setView("all");
-          props.setFolderId(null);
-        }}
-      >
+      <div className={`side-row ${is({ kind: "all" }) ? "active" : ""}`} onClick={() => props.setScope({ kind: "all" })}>
         <span className="ico">◈</span>
         <span className="name">All images</span>
         <span className="n">{props.stats?.total ?? ""}</span>
       </div>
       <div
-        className={`side-row ${props.view === "favorites" ? "active" : ""}`}
-        onClick={() => props.setView("favorites")}
+        className={`side-row ${is({ kind: "favorites" }) ? "active" : ""}`}
+        onClick={() => props.setScope({ kind: "favorites" })}
       >
         <span className="ico">♥</span>
         <span className="name">Favorites</span>
         <span className="n">{props.stats?.favorites ?? ""}</span>
       </div>
+      <div
+        className={`side-row ${is({ kind: "rejects" }) ? "active" : ""}`}
+        onClick={() => props.setScope({ kind: "rejects" })}
+        title="Images you've rejected — still on disk, hidden from every other view"
+      >
+        <span className="ico">⊘</span>
+        <span className="name">Rejects</span>
+        <span className="n">{props.stats?.rejects ?? ""}</span>
+      </div>
+
+      <div className="side-h">
+        Albums
+        <span className="h-act" title="New album" onClick={props.onNewAlbum}>
+          ＋
+        </span>
+      </div>
+      {props.albums.map((a) => (
+        <div
+          key={a.id}
+          className={`side-row ${is({ kind: "album", id: a.id }) ? "active" : ""}`}
+          onClick={() => props.setScope({ kind: "album", id: a.id })}
+        >
+          <span className="ico">▤</span>
+          <span className="name ltr">{a.name}</span>
+          <span className="n">{a.image_count}</span>
+          <span
+            className="rm"
+            title="Delete album (images stay in the library)"
+            onClick={(e) => {
+              e.stopPropagation();
+              props.onDeleteAlbum(a);
+            }}
+          >
+            ✕
+          </span>
+        </div>
+      ))}
+      {props.albums.length === 0 && <div className="side-empty">No albums yet</div>}
+
+      <div className="side-h">
+        Saved searches
+        <span className="h-act" title="Save the current search" onClick={props.onSaveSearch}>
+          ＋
+        </span>
+      </div>
+      {props.searches.map((s) => (
+        <div key={s.id} className="side-row" onClick={() => props.onApplySearch(s)}>
+          <span className="ico">⌕</span>
+          <span className="name ltr">{s.name}</span>
+          <span
+            className="rm"
+            title="Delete saved search"
+            onClick={(e) => {
+              e.stopPropagation();
+              props.onDeleteSearch(s.id);
+            }}
+          >
+            ✕
+          </span>
+        </div>
+      ))}
+      {props.searches.length === 0 && <div className="side-empty">Search, then save it here</div>}
+
       <div className="side-h">Folders</div>
       {props.folders.map((f) => (
         <div
           key={f.id}
-          className={`side-row ${props.folderId === f.id ? "active" : ""}`}
-          onClick={() => props.setFolderId(props.folderId === f.id ? null : f.id)}
+          className={`side-row ${is({ kind: "folder", id: f.id }) ? "active" : ""}`}
+          onClick={() =>
+            props.setScope(is({ kind: "folder", id: f.id }) ? { kind: "all" } : { kind: "folder", id: f.id })
+          }
           title={f.path}
         >
           <span className="ico">▸</span>
@@ -436,6 +766,7 @@ function Sidebar(props: {
         <span className="ico">＋</span>
         <span className="name">Add folder…</span>
       </div>
+
       <div className="side-h">Top tags</div>
       {props.tops.map((t) => (
         <div key={t.name} className={`side-row tag-row t-${t.category}`} onClick={() => props.onTag(t.name)}>
@@ -447,14 +778,123 @@ function Sidebar(props: {
   );
 }
 
+// ── BulkBar ──────────────────────────────────────────────────
+
+function BulkBar(props: {
+  count: number;
+  scope: Scope;
+  albums: api.AlbumInfo[];
+  onClear: () => void;
+  onFav: (v: boolean) => void;
+  onRate: (n: number) => void;
+  onReject: () => void;
+  onRestore: () => void;
+  onTrash: () => void;
+  onAddToAlbum: (id: number) => void;
+  onNewAlbum: () => void;
+  onRemoveFromAlbum: () => void;
+}) {
+  const [albumOpen, setAlbumOpen] = useState(false);
+  const inRejects = props.scope.kind === "rejects";
+
+  return (
+    <div className="bulkbar">
+      <span className="bulk-count">
+        <b>{props.count}</b> selected
+      </span>
+
+      <div className="bulk-stars" title="Rate the selection">
+        {[1, 2, 3, 4, 5].map((i) => (
+          <span key={i} onClick={() => props.onRate(i)}>
+            ★
+          </span>
+        ))}
+        <span className="clear-stars" onClick={() => props.onRate(0)} title="Clear rating">
+          ✕
+        </span>
+      </div>
+
+      <button className="bulk-btn" onClick={() => props.onFav(true)}>
+        ♥ Favorite
+      </button>
+      <button className="bulk-btn" onClick={() => props.onFav(false)}>
+        ♡ Unfavorite
+      </button>
+
+      <div className="bulk-album">
+        <button className="bulk-btn" onClick={() => setAlbumOpen((o) => !o)}>
+          ▤ Add to album ▾
+        </button>
+        {albumOpen && (
+          <>
+            <div className="pop-back" onClick={() => setAlbumOpen(false)} />
+            <div className="pop">
+              {props.albums.map((a) => (
+                <div
+                  key={a.id}
+                  className="dd-row"
+                  onClick={() => {
+                    props.onAddToAlbum(a.id);
+                    setAlbumOpen(false);
+                  }}
+                >
+                  <span>{a.name}</span>
+                  <span className="cnt">{a.image_count}</span>
+                </div>
+              ))}
+              {props.albums.length === 0 && <div className="pop-empty">No albums yet</div>}
+              <div
+                className="dd-row new"
+                onClick={() => {
+                  props.onNewAlbum();
+                  setAlbumOpen(false);
+                }}
+              >
+                ＋ New album…
+              </div>
+            </div>
+          </>
+        )}
+      </div>
+
+      {props.scope.kind === "album" && (
+        <button className="bulk-btn" onClick={props.onRemoveFromAlbum}>
+          ⊖ Remove from album
+        </button>
+      )}
+
+      {inRejects ? (
+        <>
+          <button className="bulk-btn" onClick={props.onRestore}>
+            ↩ Restore
+          </button>
+          <button className="bulk-btn danger" onClick={props.onTrash}>
+            🗑 Recycle Bin…
+          </button>
+        </>
+      ) : (
+        <button className="bulk-btn" onClick={props.onReject} title="Hide from every view except Rejects (Del)">
+          ⊘ Reject
+        </button>
+      )}
+
+      <button className="bulk-btn ghost" onClick={props.onClear}>
+        Clear
+      </button>
+    </div>
+  );
+}
+
 // ── Grid ─────────────────────────────────────────────────────
 
 function Grid(props: {
   cards: api.ImageCard[];
   total: number;
   filters: Filter[];
-  selectedId: number | null;
-  onSelect: (id: number) => void;
+  scope: Scope;
+  sel: Set<number>;
+  primaryId: number | null;
+  onSelect: (id: number, mods: Mods) => void;
   onOpen: (id: number) => void;
   onFav: (id: number, current: boolean) => void;
   onLoadMore: () => void;
@@ -499,50 +939,60 @@ function Grid(props: {
     return buckets;
   }, [props.cards, cols]);
 
-  const selIdx = props.cards.findIndex((c) => c.id === props.selectedId);
+  const multi = props.sel.size > 1;
 
   return (
     <div className="gridwrap" ref={wrapRef}>
       <div className="result-line">
         <b>{props.total}</b> image{props.total === 1 ? "" : "s"}
+        {props.scope.kind === "rejects" && <> in Rejects</>}
         {props.filters.length > 0 && (
           <> matching {props.filters.map((f) => (f.neg ? "−" : "") + f.tag).join(" · ")}</>
         )}
-        {selIdx >= 0 && <span> · #{selIdx + 1} selected</span>}
+        {props.sel.size > 0 && <span> · {props.sel.size} selected</span>}
+        {props.total === 0 && props.scope.kind === "rejects" && (
+          <> — nothing rejected yet. Select images and press Del to reject them.</>
+        )}
       </div>
       <div className="masonry">
         {columns.map((bucket, i) => (
           <div className="mcol" key={i}>
-            {bucket.map((c) => (
-              <div
-                key={c.id}
-                className={`card ${c.id === props.selectedId ? "sel" : ""}`}
-                onClick={() => props.onSelect(c.id)}
-                onDoubleClick={() => props.onOpen(c.id)}
-              >
-                <img
-                  src={api.thumbUrl(c.id)}
-                  loading="lazy"
-                  style={{ aspectRatio: `${c.width || 1} / ${c.height || 1}` }}
-                  alt=""
-                />
+            {bucket.map((c) => {
+              const selected = props.sel.has(c.id);
+              return (
                 <div
-                  className={`fav ${c.favorite ? "on" : ""}`}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    props.onFav(c.id, c.favorite);
-                  }}
+                  key={c.id}
+                  className={`card ${selected ? "sel" : ""} ${c.id === props.primaryId ? "primary" : ""}`}
+                  onClick={(e) =>
+                    props.onSelect(c.id, { shift: e.shiftKey, ctrl: e.ctrlKey || e.metaKey })
+                  }
+                  onDoubleClick={() => props.onOpen(c.id)}
                 >
-                  {c.favorite ? "♥" : "♡"}
+                  <img
+                    src={api.thumbUrl(c.id)}
+                    loading="lazy"
+                    style={{ aspectRatio: `${c.width || 1} / ${c.height || 1}` }}
+                    alt=""
+                  />
+                  {multi && selected && <div className="selmark">✓</div>}
+                  <div
+                    className={`fav ${c.favorite ? "on" : ""}`}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      props.onFav(c.id, c.favorite);
+                    }}
+                  >
+                    {c.favorite ? "♥" : "♡"}
+                  </div>
+                  <div className="ov">
+                    <span>
+                      {c.width}×{c.height}
+                    </span>
+                    <span className="stars-mini">{"★".repeat(c.rating)}</span>
+                  </div>
                 </div>
-                <div className="ov">
-                  <span>
-                    {c.width}×{c.height}
-                  </span>
-                  <span className="stars-mini">{"★".repeat(c.rating)}</span>
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         ))}
       </div>
@@ -750,6 +1200,51 @@ function Viewer(props: {
           <div className="v-prompt">{d.raw_prompt}</div>
         </div>
       )}
+    </div>
+  );
+}
+
+// ── NameModal ────────────────────────────────────────────────
+
+function NameModal(props: { prompt: NamePrompt; onClose: () => void }) {
+  const [v, setV] = useState(props.prompt.initial ?? "");
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    inputRef.current?.focus();
+    inputRef.current?.select();
+  }, []);
+
+  const submit = () => {
+    const value = v.trim();
+    if (!value) return;
+    props.prompt.onSubmit(value);
+    props.onClose();
+  };
+
+  return (
+    <div className="modal-back" onClick={props.onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-title">{props.prompt.title}</div>
+        <input
+          ref={inputRef}
+          value={v}
+          placeholder={props.prompt.placeholder}
+          onChange={(e) => setV(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") submit();
+            else if (e.key === "Escape") props.onClose();
+          }}
+        />
+        <div className="modal-actions">
+          <button className="copybtn" onClick={props.onClose}>
+            Cancel
+          </button>
+          <button className="copybtn accent" onClick={submit} disabled={!v.trim()}>
+            OK
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

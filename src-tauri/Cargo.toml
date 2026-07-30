@@ -1,6 +1,6 @@
 [package]
 name = "nai-gallery"
-version = "0.1.0"
+version = "0.2.0"
 description = "Local gallery for NovelAI-generated images"
 authors = ["you"]
 edition = "2021"
