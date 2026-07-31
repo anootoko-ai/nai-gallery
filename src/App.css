@@ -394,6 +394,130 @@ body {
 .copybtn.accent { color: var(--accent); border-color: var(--accent-dim); }
 .copybtn:disabled { opacity: .45; cursor: default; }
 
-::-webkit-scrollbar { width: 10px; }
+/* ── Full-pane tools (Duplicates, Analytics) ─────────── */
+/* both live in the grid column and reuse .gridwrap's scroll + padding */
+.pane-head {
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  padding-bottom: 10px; margin-bottom: 12px;
+  border-bottom: 1px solid var(--border);
+}
+.pane-title { font-size: 14px; font-weight: 600; color: var(--text); }
+.pane-head .copybtn { margin-left: auto; padding: 4px 10px; font-size: 11.5px; }
+.pane-note {
+  margin-bottom: 12px; padding: 7px 11px; border-radius: 6px;
+  background: rgba(217,166,72,.08); border: 1px solid var(--accent-dim);
+  font-size: 11.5px; color: var(--accent); line-height: 1.5;
+}
+.pane-empty { padding: 40px 20px; color: var(--faint); text-align: center; }
+
+/* threshold slider */
+.dup-thresh { display: flex; align-items: center; gap: 8px; color: var(--faint); font-size: 11.5px; }
+.dup-thresh label { text-transform: uppercase; letter-spacing: 1.1px; font-size: 10px; }
+.dup-thresh input { width: 130px; accent-color: var(--accent); }
+.dup-thresh-v { color: var(--dim); font-family: var(--mono); min-width: 62px; }
+
+/* one duplicate group — a horizontal row of candidates plus its actions */
+.dupgroup {
+  margin-bottom: 12px; padding: 10px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+}
+.dupmembers { display: flex; gap: 10px; overflow-x: auto; padding-bottom: 4px; }
+.dupcard {
+  flex: none; width: 178px;
+  display: flex; flex-direction: column; gap: 6px;
+  padding: 6px; border-radius: 6px;
+  background: var(--ground); border: 1px solid transparent;
+}
+.dupcard.keep { border-color: var(--accent-dim); background: rgba(217,166,72,.07); }
+.dupthumb { position: relative; cursor: pointer; border-radius: 4px; overflow: hidden; background: #0d0c10; }
+.dupthumb img { display: block; width: 100%; height: 148px; object-fit: contain; }
+.dupthumb:hover img { filter: brightness(1.1); }
+.dupdist {
+  position: absolute; top: 5px; left: 5px;
+  padding: 1px 5px; border-radius: 3px;
+  background: rgba(10,9,13,.78); color: var(--dim);
+  font-family: var(--mono); font-size: 10px;
+}
+.dupdist.exact { color: var(--accent); }
+.dupsug {
+  position: absolute; top: 5px; right: 5px;
+  padding: 1px 5px; border-radius: 3px;
+  background: rgba(10,9,13,.78); color: var(--faint); font-size: 9.5px;
+  text-transform: uppercase; letter-spacing: .8px;
+}
+.dupmeta { display: flex; flex-direction: column; gap: 2px; font-family: var(--mono); font-size: 10px; color: var(--faint); }
+.dupmeta .f { color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dupmarks { display: flex; align-items: center; gap: 6px; }
+.dupmarks .on { color: var(--accent); }
+.keepbtn {
+  padding: 3px 0; border-radius: 5px;
+  border: 1px solid var(--border); background: var(--panel);
+  color: var(--faint); cursor: pointer; font: inherit; font-size: 11.5px;
+}
+.keepbtn:hover { color: var(--text); border-color: var(--accent-dim); }
+.keepbtn.on { color: var(--accent); border-color: var(--accent-dim); background: rgba(217,166,72,.12); }
+.dupactions {
+  display: flex; align-items: center; gap: 8px;
+  margin-top: 9px; padding-top: 9px; border-top: 1px solid var(--border);
+}
+.dupactions .dup-n { color: var(--faint); font-size: 11.5px; margin-right: auto; }
+.dupactions .bulk-btn:disabled { opacity: .4; cursor: default; }
+.dupactions .bulk-btn:disabled:hover { color: var(--dim); border-color: var(--border); }
+
+/* ── Analytics ───────────────────────────── */
+.an-sec { margin-bottom: 26px; display: flex; flex-direction: column; gap: 9px; }
+.an-sub { font-size: 11.5px; color: var(--faint); display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.an-sub b { color: var(--dim); font-weight: 600; font-variant-numeric: tabular-nums; }
+.an-legend { display: flex; gap: 12px; margin-left: auto; }
+.an-key { display: inline-flex; align-items: center; gap: 4px; }
+.an-key i { font-style: normal; line-height: 1; }
+
+/* gens-per-day columns; the container's baseline is the axis rule */
+.an-time {
+  display: flex; align-items: flex-end; gap: 2px;
+  height: 132px; padding-top: 4px;
+  border-bottom: 1px solid var(--border);
+}
+.an-col { flex: 1; min-width: 0; height: 100%; display: flex; align-items: flex-end; }
+.an-col:hover { background: var(--hover); }
+.an-colbar {
+  width: 100%; min-height: 0;
+  background: var(--accent-dim); border-radius: 3px 3px 0 0;
+}
+.an-col:hover .an-colbar { background: var(--accent); }
+.an-axis {
+  display: flex; justify-content: space-between;
+  font-family: var(--mono); font-size: 10px; color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ranked horizontal bars, shared by top tags and tag pairs */
+.an-rows { display: flex; flex-direction: column; gap: 3px; }
+.an-row {
+  display: grid; grid-template-columns: 200px 1fr 46px; align-items: center; gap: 10px;
+  padding: 2px 4px; border-radius: 4px;
+}
+.an-row:hover { background: var(--hover); }
+.an-row .an-rank {
+  width: 18px; text-align: right; color: var(--faint);
+  font-family: var(--mono); font-size: 10px; font-variant-numeric: tabular-nums;
+}
+.an-row.pairrow { grid-template-columns: 18px 200px 1fr 46px; }
+.an-label {
+  font-family: var(--mono); font-size: 11.5px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.an-label.pair { color: var(--dim); }
+.an-label.pair i { color: var(--faint); font-style: normal; padding: 0 5px; }
+.an-track { height: 9px; background: var(--raised); border-radius: 4px; overflow: hidden; }
+.an-fill { display: block; height: 100%; background: currentColor; border-radius: 0 4px 4px 0; }
+.an-fill.accent { color: var(--accent-dim); }
+.an-row:hover .an-fill.accent { color: var(--accent); }
+.an-val {
+  text-align: right; color: var(--faint);
+  font-family: var(--mono); font-size: 11px; font-variant-numeric: tabular-nums;
+}
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-thumb { background: var(--raised); border-radius: 5px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--hover); }

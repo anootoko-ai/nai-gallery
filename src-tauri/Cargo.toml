@@ -1,6 +1,6 @@
 [package]
 name = "nai-gallery"
-version = "0.3.0"
+version = "0.4.0"
 description = "Local gallery for NovelAI-generated images"
 authors = ["you"]
 edition = "2021"
@@ -30,6 +30,8 @@ notify-debouncer-mini = "0.6"
 rayon = "1"
 regex = "1"
 trash = "5"
+# stealth alpha-channel metadata payloads are gzip-compressed
+flate2 = "1"
 
 [profile.dev]
 # image decoding is unusably slow at opt-level 0

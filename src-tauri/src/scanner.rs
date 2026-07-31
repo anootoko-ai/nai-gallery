@@ -228,6 +228,55 @@ pub fn scan_folder(app: &AppHandle, folder_id: i64, root: &str) -> Result<usize,
         }
     });
 
+    // phash pass: hash anything still lacking one, from its cached
+    // thumbnail (dHash downsamples to 9x8, so thumbnail resolution is
+    // plenty and the small JPEGs decode far faster than originals).
+    // Covers fresh inserts, content-changed files (the upsert resets
+    // phash to NULL), and libraries indexed before hashing existed.
+    // Failures stay NULL and are retried on the next scan.
+    let unhashed: Vec<i64> = {
+        let conn = db.0.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT id FROM images WHERE folder_id = ?1 AND phash IS NULL")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([folder_id], |r| r.get(0))
+            .map_err(|e| e.to_string())?
+            .filter_map(Result::ok)
+            .collect();
+        rows
+    };
+    let hash_total = unhashed.len();
+    let hash_counter = AtomicUsize::new(0);
+    let hashes: Vec<(i64, i64)> = unhashed
+        .par_iter()
+        .filter_map(|id| {
+            let data = std::fs::read(thumbs.join(format!("{id}.jpg"))).ok()?;
+            let img = image::load_from_memory(&data).ok()?;
+            let done = hash_counter.fetch_add(1, Ordering::Relaxed) + 1;
+            if done % 100 == 0 || done == hash_total {
+                app.emit(
+                    "hash:progress",
+                    ScanProgress {
+                        done,
+                        total: hash_total,
+                        folder: folder_name.clone(),
+                    },
+                )
+                .ok();
+            }
+            Some((*id, crate::hash::dhash(&img)))
+        })
+        .collect();
+    {
+        let mut conn = db.0.lock().unwrap();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        for (id, hash) in &hashes {
+            crate::db::set_phash(&tx, *id, *hash).map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+    }
+
     app.emit("scan:done", total).ok();
     Ok(total)
 }
@@ -295,7 +344,8 @@ fn insert_image(conn: &rusqlite::Connection, folder_id: i64, f: &ParsedFile) -> 
          ON CONFLICT(path) DO UPDATE SET
            file_size=?3, file_mtime=?4, width=?5, height=?6, is_novelai=?7,
            model=?8, seed=?9, sampler=?10, steps=?11, scale=?12,
-           raw_prompt=?13, raw_negative=?14, comment_json=?15",
+           raw_prompt=?13, raw_negative=?14, comment_json=?15,
+           phash=NULL",
         rusqlite::params![
             f.path,
             folder_id,

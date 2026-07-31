@@ -22,6 +22,11 @@ type Scope =
   | { kind: "folder"; id: number; relDir?: string }
   | { kind: "album"; id: number };
 
+/// What fills the centre column. The grid is the app; the other two are
+/// full-pane tools that replace it and are left with Esc, like the viewer.
+/// Scope stays untouched while one is open, so leaving restores the grid.
+type View = "grid" | "duplicates" | "analytics";
+
 /// One directory in a watched root's subfolder tree. `count` is aggregate:
 /// images directly here plus everything below.
 interface DirNode {
@@ -149,6 +154,7 @@ export default function App() {
   // ── query state ──
   const [filters, setFilters] = useState<Filter[]>([]);
   const [scope, setScope] = useState<Scope>({ kind: "all" });
+  const [view, setView] = useState<View>("grid");
   const [sort, setSort] = useState("newest");
   const [albumFilter, setAlbumFilter] = useState<AlbumFilter>("any");
   // ── data state ──
@@ -167,6 +173,8 @@ export default function App() {
   const [primaryId, setPrimaryId] = useState<number | null>(null);
   const [detail, setDetail] = useState<api.ImageDetail | null>(null);
   const [viewerOpen, setViewerOpen] = useState(false);
+  // the Duplicates pane runs its own viewer; while it is up, Esc belongs to it
+  const [dupViewer, setDupViewer] = useState(false);
   const [thumbWidth, setThumbWidth] = useState(210);
   const [namePrompt, setNamePrompt] = useState<NamePrompt | null>(null);
   const [update, setUpdate] = useState<Update | null>(null);
@@ -266,10 +274,16 @@ export default function App() {
       refreshMeta();
     });
     const un3 = listen<string>("scan:error", (e) => setScanMsg(`scan error: ${e.payload}`));
+    // perceptual-hash backfill after a scan — what the Duplicates pane waits on
+    const un4 = listen<{ done: number; total: number; folder: string }>(
+      "hash:progress",
+      (e) => setScanMsg(`hashing ${e.payload.done}/${e.payload.total}`)
+    );
     return () => {
       un1.then((f) => f());
       un2.then((f) => f());
       un3.then((f) => f());
+      un4.then((f) => f());
     };
   }, [runQuery, refreshMeta]);
 
@@ -366,6 +380,13 @@ export default function App() {
   }, []);
 
   // ── actions ──
+  /// Picking anything in the library returns to the grid — Duplicates and
+  /// Analytics are tools laid over it, not scopes of their own.
+  const goScope = useCallback((s: Scope) => {
+    setScope(s);
+    setView("grid");
+  }, []);
+
   const addFilter = useCallback((tag: string, neg: boolean) => {
     setFilters((f) =>
       f.some((x) => x.tag === tag && x.neg === neg) ? f : [...f, { tag, neg }]
@@ -404,19 +425,27 @@ export default function App() {
     [dropCards]
   );
 
-  const trashSelection = useCallback(async () => {
-    const ids = selIds;
-    if (!ids.length) return;
-    const ok = await confirmDialog(
-      `Move ${ids.length} file${ids.length === 1 ? "" : "s"} to the Recycle Bin?\n\n` +
-        `They leave the library and can be restored from the Windows Recycle Bin.`,
-      { title: "Move to Recycle Bin", kind: "warning", okLabel: "Move to Recycle Bin" }
-    );
-    if (!ok) return;
-    await api.trashImages(ids);
-    dropCards(ids);
-    refreshMeta();
-  }, [selIds, dropCards, refreshMeta]);
+  /// The app's only file operation, always behind the same native confirm —
+  /// whether it is fired from the Rejects view or the Duplicates pane.
+  /// Resolves to whether the files actually went to the Recycle Bin.
+  const trashIds = useCallback(
+    async (ids: number[]) => {
+      if (!ids.length) return false;
+      const ok = await confirmDialog(
+        `Move ${ids.length} file${ids.length === 1 ? "" : "s"} to the Recycle Bin?\n\n` +
+          `They leave the library and can be restored from the Windows Recycle Bin.`,
+        { title: "Move to Recycle Bin", kind: "warning", okLabel: "Move to Recycle Bin" }
+      );
+      if (!ok) return false;
+      await api.trashImages(ids);
+      dropCards(ids);
+      refreshMeta();
+      return true;
+    },
+    [dropCards, refreshMeta]
+  );
+
+  const trashSelection = useCallback(() => trashIds(selIds), [trashIds, selIds]);
 
   const addSelToAlbum = useCallback(
     async (albumId: number) => {
@@ -533,6 +562,7 @@ export default function App() {
     setScope(q.scope && typeof q.scope.kind === "string" ? q.scope : { kind: "all" });
     setSort(typeof q.sort === "string" ? q.sort : "newest");
     setAlbumFilter(q.albumFilter === "in" || q.albumFilter === "out" ? q.albumFilter : "any");
+    setView("grid");
   }, []);
 
   const pickFolder = async () => {
@@ -549,6 +579,12 @@ export default function App() {
       const tag = (e.target as HTMLElement | null)?.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA") return;
       if (namePrompt) return;
+      // the grid shortcuts all act on a selection the other panes don't show;
+      // Esc is the one key they keep, and it steps back out to the grid
+      if (view !== "grid") {
+        if (e.key === "Escape" && !dupViewer) setView("grid");
+        return;
+      }
 
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "a") {
         e.preventDefault();
@@ -601,6 +637,8 @@ export default function App() {
     viewerOpen,
     namePrompt,
     scope,
+    view,
+    dupViewer,
     loadMore,
     favorite,
     rate,
@@ -624,7 +662,9 @@ export default function App() {
       />
       <Sidebar
         scope={scope}
-        setScope={setScope}
+        setScope={goScope}
+        view={view}
+        setView={setView}
         stats={stats}
         folders={folders}
         dirTrees={dirTrees}
@@ -650,26 +690,42 @@ export default function App() {
           api.listSavedSearches().then(setSearches).catch(() => {});
         }}
       />
-      <Grid
-        cards={cards}
-        total={total}
-        filters={filters}
-        scope={scope}
-        scopeLabel={scopeLabel}
-        albumFilter={albumFilter}
-        sel={sel}
-        primaryId={primaryId}
-        onSelect={selectCard}
-        onOpen={(id) => {
-          setSel(new Set([id]));
-          setPrimaryId(id);
-          anchorRef.current = id;
-          setViewerOpen(true);
-        }}
-        onFav={(id, current) => favorite([id], !current)}
-        onLoadMore={loadMore}
-        thumbWidth={thumbWidth}
-      />
+      {view === "duplicates" ? (
+        <Duplicates
+          onTrash={trashIds}
+          onReject={(ids) => setHidden(ids, true)}
+          onViewerOpen={setDupViewer}
+          flash={flash}
+        />
+      ) : view === "analytics" ? (
+        <Analytics
+          onTag={(t) => {
+            addFilter(t, false);
+            setView("grid");
+          }}
+        />
+      ) : (
+        <Grid
+          cards={cards}
+          total={total}
+          filters={filters}
+          scope={scope}
+          scopeLabel={scopeLabel}
+          albumFilter={albumFilter}
+          sel={sel}
+          primaryId={primaryId}
+          onSelect={selectCard}
+          onOpen={(id) => {
+            setSel(new Set([id]));
+            setPrimaryId(id);
+            anchorRef.current = id;
+            setViewerOpen(true);
+          }}
+          onFav={(id, current) => favorite([id], !current)}
+          onLoadMore={loadMore}
+          thumbWidth={thumbWidth}
+        />
+      )}
       <Inspector
         detail={detail}
         onTag={(t) => addFilter(t, false)}
@@ -686,7 +742,7 @@ export default function App() {
         updating={updating}
         onInstallUpdate={installUpdate}
       />
-      {sel.size > 0 && (
+      {sel.size > 0 && view === "grid" && (
         <BulkBar
           count={sel.size}
           scope={scope}
@@ -855,6 +911,8 @@ function TopBar(props: {
 function Sidebar(props: {
   scope: Scope;
   setScope: (s: Scope) => void;
+  view: View;
+  setView: (v: View) => void;
   stats: api.LibraryStats | null;
   folders: api.FolderInfo[];
   dirTrees: Map<number, DirNode[]>;
@@ -872,7 +930,8 @@ function Sidebar(props: {
   onApplySearch: (s: api.SavedSearch) => void;
   onDeleteSearch: (id: number) => void;
 }) {
-  const is = (s: Scope) => sameScope(props.scope, s);
+  // a scope row is only the active one while the grid is what's showing
+  const is = (s: Scope) => props.view === "grid" && sameScope(props.scope, s);
   // expanded subfolder nodes, keyed like dirKey(); roots collapse by default
   const [openDirs, setOpenDirs] = useState<Set<string>>(new Set());
   const toggleDir = useCallback((key: string) => {
@@ -908,6 +967,22 @@ function Sidebar(props: {
         <span className="ico">⊘</span>
         <span className="name">Rejects</span>
         <span className="n">{props.stats?.rejects ?? ""}</span>
+      </div>
+      <div
+        className={`side-row ${props.view === "duplicates" ? "active" : ""}`}
+        onClick={() => props.setView("duplicates")}
+        title="Near-duplicate groups found by perceptual hash — same prompt, different seed, or a re-download"
+      >
+        <span className="ico">⧉</span>
+        <span className="name">Duplicates</span>
+      </div>
+      <div
+        className={`side-row ${props.view === "analytics" ? "active" : ""}`}
+        onClick={() => props.setView("analytics")}
+        title="Gens per day, tag frequency, and which tags you combine"
+      >
+        <span className="ico">▧</span>
+        <span className="name">Analytics</span>
       </div>
 
       <div className="side-h">
@@ -1395,6 +1470,433 @@ function Grid(props: {
       </div>
       <div ref={sentinelRef} style={{ height: 1 }} />
       {props.cards.length < props.total && <div className="loading-more">loading…</div>}
+    </div>
+  );
+}
+
+// ── Duplicates ───────────────────────────────────────────────
+
+/// A near-duplicate group plus the local review state layered on it. `key` is
+/// handed out at fetch time and never reused, so trashing members mid-review
+/// can't make two groups collide.
+interface DupGroup {
+  key: number;
+  members: api.DupImage[];
+  /// ids the user wants to survive; seeded with the backend's suggested keeper
+  keep: number[];
+}
+
+/// The only two fields of a member the review pane can change from its viewer.
+type MemberPatch = { favorite?: boolean; rating?: number };
+
+const DUP_DEFAULT_DISTANCE = 6;
+
+/// Hamming distance in words, so the slider means something without a manual.
+const distanceLabel = (d: number) => (d === 0 ? "exact" : d <= 8 ? "near" : "loose");
+
+const humanSize = (bytes: number) => {
+  if (bytes >= 1048576) return `${(bytes / 1048576).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${bytes} B`;
+};
+
+/// Review pane for near-duplicate groups. Owns its own result set — actions
+/// patch the affected group in place rather than refetching the whole scan,
+/// which would reshuffle everything the user is still looking at.
+function Duplicates(props: {
+  /// native-confirm trash, shared with the Rejects view; resolves false if
+  /// the user backed out of the dialog
+  onTrash: (ids: number[]) => Promise<boolean>;
+  onReject: (ids: number[]) => Promise<void>;
+  onViewerOpen: (open: boolean) => void;
+  flash: (msg: string) => void;
+}) {
+  const [maxDistance, setMaxDistance] = useState(DUP_DEFAULT_DISTANCE);
+  const [unhashed, setUnhashed] = useState(0);
+  const [groups, setGroups] = useState<DupGroup[] | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [nav, setNav] = useState<{ ids: number[]; i: number } | null>(null);
+  const [detail, setDetail] = useState<api.ImageDetail | null>(null);
+  const { onViewerOpen } = props;
+
+  const refresh = useCallback(async (distance: number) => {
+    setBusy(true);
+    try {
+      const res = await api.findDuplicates(distance);
+      setUnhashed(res.unhashed);
+      setGroups(res.groups.map((members, i) => ({ key: i, members, keep: [members[0].id] })));
+    } catch {
+      setGroups([]);
+    }
+    setBusy(false);
+  }, []);
+
+  // the scan is cheap and emits nothing — moving the slider just re-runs it
+  useEffect(() => {
+    refresh(maxDistance);
+  }, [refresh, maxDistance]);
+
+  // tell the app the overlay is up so Esc closes it instead of leaving the pane
+  useEffect(() => {
+    onViewerOpen(nav != null);
+    return () => onViewerOpen(false);
+  }, [nav, onViewerOpen]);
+
+  useEffect(() => {
+    if (!nav) {
+      setDetail(null);
+      return;
+    }
+    api.getImage(nav.ids[nav.i]).then(setDetail).catch(() => setDetail(null));
+  }, [nav]);
+
+  useEffect(() => {
+    if (!nav) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setNav(null);
+      else if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
+        e.preventDefault();
+        setNav((n) =>
+          n ? { ...n, i: Math.min(n.ids.length - 1, Math.max(0, n.i + (e.key === "ArrowRight" ? 1 : -1))) } : n
+        );
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [nav]);
+
+  const patchMember = useCallback((id: number, patch: MemberPatch) => {
+    setGroups(
+      (gs) =>
+        gs &&
+        gs.map((g) => ({ ...g, members: g.members.map((m) => (m.id === id ? { ...m, ...patch } : m)) }))
+    );
+    setDetail((d) => (d && d.id === id ? { ...d, ...patch } : d));
+  }, []);
+
+  const toggleKeep = (key: number, id: number) =>
+    setGroups(
+      (gs) =>
+        gs &&
+        gs.map((g) =>
+          g.key === key
+            ? {
+                ...g,
+                keep: g.keep.includes(id) ? g.keep.filter((k) => k !== id) : [...g.keep, id],
+              }
+            : g
+        )
+    );
+
+  /// Apply an action to everything in the group the user did NOT mark keep,
+  /// then fold the group away locally: what's left is either a smaller group
+  /// or a single survivor, which is no longer a duplicate of anything.
+  const applyToOthers = async (g: DupGroup, mode: "trash" | "reject") => {
+    const others = g.members.filter((m) => !g.keep.includes(m.id)).map((m) => m.id);
+    if (!others.length) return;
+    if (mode === "trash") {
+      if (!(await props.onTrash(others))) return;
+    } else {
+      await props.onReject(others);
+    }
+    const gone = new Set(others);
+    setGroups(
+      (gs) =>
+        gs &&
+        gs.flatMap((x) => {
+          if (x.key !== g.key) return [x];
+          const members = x.members.filter((m) => !gone.has(m.id));
+          if (members.length < 2) return [];
+          return [{ ...x, members, keep: x.keep.filter((k) => members.some((m) => m.id === k)) }];
+        })
+    );
+    props.flash(
+      mode === "trash"
+        ? `${others.length} duplicate${others.length === 1 ? "" : "s"} moved to the Recycle Bin`
+        : `rejected ${others.length} duplicate${others.length === 1 ? "" : "s"}`
+    );
+  };
+
+  const shown = groups?.reduce((n, g) => n + g.members.length, 0) ?? 0;
+
+  return (
+    <div className="gridwrap">
+      <div className="pane-head">
+        <div className="pane-title">Duplicates</div>
+        <div className="dup-thresh">
+          <label htmlFor="dup-dist">similarity</label>
+          <input
+            id="dup-dist"
+            type="range"
+            min={0}
+            max={16}
+            value={maxDistance}
+            title="Hamming distance between perceptual hashes — 0 only matches visual twins"
+            onChange={(e) => setMaxDistance(Number(e.target.value))}
+          />
+          <span className="dup-thresh-v">
+            ≤{maxDistance} · {distanceLabel(maxDistance)}
+          </span>
+        </div>
+        <button className="copybtn" disabled={busy} onClick={() => refresh(maxDistance)}>
+          ⟳ Refresh
+        </button>
+      </div>
+
+      {unhashed > 0 && (
+        <div className="pane-note">
+          {unhashed} image{unhashed === 1 ? "" : "s"} not hashed yet — results may be incomplete.
+          Hashing runs automatically after a scan; refresh once it finishes.
+        </div>
+      )}
+
+      <div className="result-line">
+        {busy && groups === null ? (
+          <>looking for duplicates…</>
+        ) : (
+          <>
+            <b>{groups?.length ?? 0}</b> group{(groups?.length ?? 0) === 1 ? "" : "s"} · {shown} images
+            at distance ≤ {maxDistance}
+          </>
+        )}
+      </div>
+
+      {groups?.map((g) => {
+        const others = g.members.length - g.keep.length;
+        return (
+          <div className="dupgroup" key={g.key}>
+            <div className="dupmembers">
+              {g.members.map((m, i) => {
+                const kept = g.keep.includes(m.id);
+                return (
+                  <div className={`dupcard ${kept ? "keep" : ""}`} key={m.id}>
+                    <div
+                      className="dupthumb"
+                      title="Open full size"
+                      onClick={() => setNav({ ids: g.members.map((x) => x.id), i })}
+                    >
+                      <img src={api.thumbUrl(m.id)} loading="lazy" alt="" />
+                      <span className={`dupdist ${m.distance === 0 ? "exact" : ""}`}>
+                        {m.distance === 0 ? "exact" : `Δ${m.distance}`}
+                      </span>
+                      {i === 0 && <span className="dupsug">suggested</span>}
+                    </div>
+                    <div className="dupmeta">
+                      <span className="f" title={m.path}>
+                        {m.file_name}
+                      </span>
+                      <span>
+                        {m.width}×{m.height} · {humanSize(m.file_size)}
+                      </span>
+                      <span>
+                        {new Date(m.file_mtime * 1000).toLocaleDateString()} · seed {m.seed ?? "—"}
+                      </span>
+                      <span className="dupmarks">
+                        <span className={m.favorite ? "on" : ""}>{m.favorite ? "♥" : "♡"}</span>
+                        <span className="stars-mini">{"★".repeat(m.rating)}</span>
+                      </span>
+                    </div>
+                    <button
+                      className={`keepbtn ${kept ? "on" : ""}`}
+                      title={kept ? "Keep this one" : "Click to keep this one instead"}
+                      onClick={() => toggleKeep(g.key, m.id)}
+                    >
+                      {kept ? "✓ keep" : "keep"}
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+            <div className="dupactions">
+              <span className="dup-n">
+                keeping {g.keep.length} of {g.members.length}
+              </span>
+              <button
+                className="bulk-btn"
+                disabled={others === 0}
+                title="Hide the others from every view except Rejects — reversible"
+                onClick={() => applyToOthers(g, "reject")}
+              >
+                ⊘ Reject others
+              </button>
+              <button
+                className="bulk-btn danger"
+                disabled={others === 0}
+                title="Move the others to the Windows Recycle Bin"
+                onClick={() => applyToOthers(g, "trash")}
+              >
+                🗑 Trash others…
+              </button>
+            </div>
+          </div>
+        );
+      })}
+
+      {groups?.length === 0 && !busy && <div className="pane-empty">No duplicates at this threshold.</div>}
+
+      {nav && detail && (
+        <Viewer
+          detail={detail}
+          onClose={() => setNav(null)}
+          onNav={(dir) =>
+            setNav((n) => n && { ...n, i: Math.min(n.ids.length - 1, Math.max(0, n.i + dir)) })
+          }
+          onFav={async (id, current) => {
+            await api.setFavoriteBulk([id], !current);
+            patchMember(id, { favorite: !current });
+          }}
+          onRate={async (id, n) => {
+            await api.setRatingBulk([id], n);
+            patchMember(id, { rating: n });
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+// ── Analytics ────────────────────────────────────────────────
+
+const ANALYTICS_DAYS = 90;
+const ANALYTICS_TAGS = 30;
+const ANALYTICS_PAIRS = 20;
+
+const isoDay = (d: Date) =>
+  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+
+/// The backend only returns days that have images; a timeline needs the empty
+/// ones too or the spacing lies about when things were generated.
+function fillDays(rows: api.DayCount[], days: number): api.DayCount[] {
+  const byDay = new Map(rows.map((r) => [r.day, r.count]));
+  const cursor = new Date();
+  cursor.setHours(12, 0, 0, 0); // midday, so DST shifts can't skip a day
+  cursor.setDate(cursor.getDate() - (days - 1));
+  const out: api.DayCount[] = [];
+  for (let i = 0; i < days; i++) {
+    const day = isoDay(cursor);
+    out.push({ day, count: byDay.get(day) ?? 0 });
+    cursor.setDate(cursor.getDate() + 1);
+  }
+  return out;
+}
+
+/// A short date for the timeline axis — the year is the same throughout a
+/// 90-day window, so it only costs space.
+const shortDay = (iso: string) => iso.slice(5).replace("-", "/");
+
+/// Read-only overview of the library: when you generate, what you tag with,
+/// and which tags you combine. Every tag is a live link back into search.
+function Analytics(props: { onTag: (t: string) => void }) {
+  const [rows, setRows] = useState<api.DayCount[] | null>(null);
+  const [freq, setFreq] = useState<api.TagSuggestion[]>([]);
+  const [pairs, setPairs] = useState<api.TagPair[]>([]);
+
+  useEffect(() => {
+    api.imagesPerDay(ANALYTICS_DAYS).then(setRows).catch(() => setRows([]));
+    api.tagFrequency(ANALYTICS_TAGS).then(setFreq).catch(() => {});
+    api.tagCooccurrence(ANALYTICS_PAIRS).then(setPairs).catch(() => {});
+  }, []);
+
+  const series = useMemo(() => fillDays(rows ?? [], ANALYTICS_DAYS), [rows]);
+  const peak = Math.max(1, ...series.map((d) => d.count));
+  const generated = series.reduce((n, d) => n + d.count, 0);
+  const activeDays = series.reduce((n, d) => n + (d.count > 0 ? 1 : 0), 0);
+  const topTag = freq[0]?.count ?? 1;
+  const topPair = pairs[0]?.count ?? 1;
+
+  return (
+    <div className="gridwrap">
+      <div className="pane-head">
+        <div className="pane-title">Analytics</div>
+      </div>
+
+      <div className="an-sec">
+        <div className="insp-h">Images per day · last {ANALYTICS_DAYS} days</div>
+        <div className="an-sub">
+          <b>{generated}</b> image{generated === 1 ? "" : "s"} across <b>{activeDays}</b> active day
+          {activeDays === 1 ? "" : "s"} · busiest day <b>{peak}</b>
+        </div>
+        <div className="an-time">
+          {series.map((d) => (
+            <div
+              key={d.day}
+              className="an-col"
+              title={`${d.day} · ${d.count} image${d.count === 1 ? "" : "s"}`}
+            >
+              <div className="an-colbar" style={{ height: `${(d.count / peak) * 100}%` }} />
+            </div>
+          ))}
+        </div>
+        <div className="an-axis">
+          <span>{shortDay(series[0].day)}</span>
+          <span>{shortDay(series[Math.floor(ANALYTICS_DAYS / 2)].day)}</span>
+          <span>{shortDay(series[ANALYTICS_DAYS - 1].day)}</span>
+        </div>
+      </div>
+
+      <div className="an-sec">
+        <div className="insp-h">Top tags</div>
+        <div className="an-sub">
+          by image count, hidden tags excluded — click one to search for it
+          <span className="an-legend">
+            {[
+              ["general", "general"],
+              ["artist", "artist"],
+              ["char", "character"],
+            ].map(([cat, label]) => (
+              <span key={cat} className="an-key">
+                <i className={`t-${cat}`}>▬</i>
+                {label}
+              </span>
+            ))}
+          </span>
+        </div>
+        <div className="an-rows">
+          {freq.map((t) => (
+            <div
+              key={t.name}
+              className="an-row linkish"
+              title={`${t.name} · ${t.count} images`}
+              onClick={() => props.onTag(t.name)}
+            >
+              <span className={`an-label t-${t.category}`}>{t.name}</span>
+              <span className="an-track">
+                <span className={`an-fill t-${t.category}`} style={{ width: `${(t.count / topTag) * 100}%` }} />
+              </span>
+              <span className="an-val">{t.count}</span>
+            </div>
+          ))}
+          {freq.length === 0 && <div className="pane-empty">No tags indexed yet.</div>}
+        </div>
+      </div>
+
+      <div className="an-sec">
+        <div className="insp-h">Tags you combine</div>
+        <div className="an-sub">
+          pairs sharing an image, counted over your most-used tags
+        </div>
+        <div className="an-rows">
+          {pairs.map((p, i) => (
+            <div key={`${p.a} ${p.b}`} className="an-row pairrow" title={`${p.a} + ${p.b} · ${p.count} images`}>
+              <span className="an-rank">{i + 1}</span>
+              <span className="an-label pair">
+                <span className="linkish" onClick={() => props.onTag(p.a)}>
+                  {p.a}
+                </span>
+                <i>+</i>
+                <span className="linkish" onClick={() => props.onTag(p.b)}>
+                  {p.b}
+                </span>
+              </span>
+              <span className="an-track">
+                <span className="an-fill accent" style={{ width: `${(p.count / topPair) * 100}%` }} />
+              </span>
+              <span className="an-val">{p.count}</span>
+            </div>
+          ))}
+          {pairs.length === 0 && <div className="pane-empty">Not enough tagged images yet.</div>}
+        </div>
+      </div>
     </div>
   );
 }

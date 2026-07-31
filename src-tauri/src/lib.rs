@@ -1,4 +1,5 @@
 mod db;
+mod hash;
 mod nai;
 mod scanner;
 
@@ -240,6 +241,39 @@ fn folder_tree(db: State<Db>) -> Result<Vec<db::DirEntry>, String> {
     db::folder_tree(&conn).map_err(|e| e.to_string())
 }
 
+/// Near-duplicate groups among visible images. `max_distance` is the
+/// Hamming threshold between 64-bit dHashes: 0 catches re-encodes/exact
+/// twins, ~6 near-duplicates, 10+ gets loose.
+#[tauri::command]
+fn find_duplicates(db: State<Db>, max_distance: u32) -> Result<db::DupResult, String> {
+    let conn = db.0.lock().unwrap();
+    db::find_duplicates(&conn, max_distance).map_err(|e| e.to_string())
+}
+
+// ── phase 3: tag analytics ───────────────────────────────────
+
+/// Top tags by visible-image count. Read-only aggregation over the index —
+/// hidden tags and negative-prompt rows are excluded, as everywhere else.
+#[tauri::command]
+fn tag_frequency(db: State<Db>, limit: i64) -> Result<Vec<db::TagSuggestion>, String> {
+    let conn = db.0.lock().unwrap();
+    db::tag_frequency(&conn, limit).map_err(|e| e.to_string())
+}
+
+/// Tag pairs that appear on the same image, most frequent first.
+#[tauri::command]
+fn tag_cooccurrence(db: State<Db>, limit: i64) -> Result<Vec<db::TagPair>, String> {
+    let conn = db.0.lock().unwrap();
+    db::tag_cooccurrence(&conn, limit).map_err(|e| e.to_string())
+}
+
+/// Visible images per local calendar day over the last `days` days.
+#[tauri::command]
+fn images_per_day(db: State<Db>, days: i64) -> Result<Vec<db::DayCount>, String> {
+    let conn = db.0.lock().unwrap();
+    db::images_per_day(&conn, days).map_err(|e| e.to_string())
+}
+
 /// Move files to the OS recycle bin and drop them from the index.
 /// The ONLY file-modifying operation in the app; triggered explicitly by the user.
 #[tauri::command]
@@ -424,7 +458,11 @@ pub fn run() {
             remove_user_tag,
             set_tag_hidden,
             list_hidden_tags,
-            folder_tree
+            folder_tree,
+            find_duplicates,
+            tag_frequency,
+            tag_cooccurrence,
+            images_per_day
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

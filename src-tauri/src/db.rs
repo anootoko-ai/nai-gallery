@@ -67,6 +67,9 @@ CREATE TABLE IF NOT EXISTS saved_searches(
 const MIGRATIONS: &[&str] = &[
     // 1: per-user tag hiding (phase 2.5)
     "ALTER TABLE tags ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0;",
+    // 2: perceptual hash for near-duplicate detection (phase 3);
+    // NULL = not yet computed, backfilled from thumbnails during scans
+    "ALTER TABLE images ADD COLUMN phash INTEGER;",
 ];
 
 fn migrate(conn: &Connection) -> rusqlite::Result<()> {
@@ -638,6 +641,245 @@ pub fn folder_tree(conn: &Connection) -> rusqlite::Result<Vec<DirEntry>> {
     Ok(out)
 }
 
+// ── phase 3: near-duplicate detection ────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct DupImage {
+    pub id: i64,
+    pub path: String,
+    pub file_name: String,
+    pub width: u32,
+    pub height: u32,
+    pub file_size: i64,
+    pub file_mtime: i64,
+    pub seed: Option<i64>,
+    pub rating: i64,
+    pub favorite: bool,
+    /// Hamming distance to the closest other member (0 = visual twin).
+    pub distance: u32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DupResult {
+    /// Visible images with no hash yet (thumbnails still being generated);
+    /// nonzero means groups may be incomplete.
+    pub unhashed: i64,
+    pub groups: Vec<Vec<DupImage>>,
+}
+
+/// Union-find grouping of hashes within `max_distance` of each other
+/// (transitive: A~B and B~C group A,B,C even if A–C exceeds the limit).
+/// Returns groups of (index, min distance to another member), ≥2 members.
+fn group_hashes(hashes: &[i64], max_distance: u32) -> Vec<Vec<(usize, u32)>> {
+    use rayon::prelude::*;
+    let n = hashes.len();
+    // O(n²) pair scan: ~1s at 50k images, and libraries are far smaller.
+    // Revisit with BK-tree / multi-index only if that stops being true.
+    let edges: Vec<(usize, usize, u32)> = (0..n)
+        .into_par_iter()
+        .flat_map_iter(|i| {
+            let hi = hashes[i];
+            (i + 1..n).filter_map(move |j| {
+                let d = (hi ^ hashes[j]).count_ones();
+                (d <= max_distance).then_some((i, j, d))
+            })
+        })
+        .collect();
+
+    fn find(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        x
+    }
+    let mut parent: Vec<usize> = (0..n).collect();
+    let mut min_dist = vec![u32::MAX; n];
+    for &(i, j, d) in &edges {
+        let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
+        if ri != rj {
+            parent[ri] = rj;
+        }
+        min_dist[i] = min_dist[i].min(d);
+        min_dist[j] = min_dist[j].min(d);
+    }
+    let mut groups: std::collections::HashMap<usize, Vec<(usize, u32)>> =
+        std::collections::HashMap::new();
+    for i in 0..n {
+        if min_dist[i] != u32::MAX {
+            groups.entry(find(&mut parent, i)).or_default().push((i, min_dist[i]));
+        }
+    }
+    groups.into_values().filter(|g| g.len() >= 2).collect()
+}
+
+pub fn find_duplicates(conn: &Connection, max_distance: u32) -> rusqlite::Result<DupResult> {
+    let unhashed: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM images WHERE hidden = 0 AND phash IS NULL",
+        [],
+        |r| r.get(0),
+    )?;
+    let (ids, hashes): (Vec<i64>, Vec<i64>) = {
+        let mut stmt =
+            conn.prepare("SELECT id, phash FROM images WHERE hidden = 0 AND phash IS NOT NULL")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter().unzip()
+    };
+
+    let mut detail_stmt = conn.prepare(
+        "SELECT path, width, height, file_size, file_mtime, seed, rating, favorite
+         FROM images WHERE id = ?1",
+    )?;
+    let mut groups: Vec<Vec<DupImage>> = Vec::new();
+    for members in group_hashes(&hashes, max_distance) {
+        let mut group = Vec::with_capacity(members.len());
+        for (idx, distance) in members {
+            let id = ids[idx];
+            let img = detail_stmt.query_row(params![id], |r| {
+                let path: String = r.get(0)?;
+                let file_name = Path::new(&path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                Ok(DupImage {
+                    id,
+                    file_name,
+                    path,
+                    width: r.get(1)?,
+                    height: r.get(2)?,
+                    file_size: r.get(3)?,
+                    file_mtime: r.get(4)?,
+                    seed: r.get(5)?,
+                    rating: r.get(6)?,
+                    favorite: r.get::<_, i64>(7)? != 0,
+                    distance,
+                })
+            })?;
+            group.push(img);
+        }
+        // likely keeper first: favorited, then rated, then biggest file
+        group.sort_by(|a, b| {
+            (b.favorite, b.rating, b.file_size, a.id).cmp(&(a.favorite, a.rating, a.file_size, b.id))
+        });
+        groups.push(group);
+    }
+    // most recent batches first
+    groups.sort_by_key(|g| std::cmp::Reverse(g.iter().map(|i| i.file_mtime).max().unwrap_or(0)));
+    Ok(DupResult { unhashed, groups })
+}
+
+// ── phase 3: tag analytics ───────────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct TagPair {
+    pub a: String,
+    pub b: String,
+    /// Visible images carrying both tags.
+    pub count: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DayCount {
+    /// Local calendar day, ISO `YYYY-MM-DD`.
+    pub day: String,
+    pub count: i64,
+}
+
+/// Rows every analytics aggregate counts: visible images, tags the user
+/// hasn't hidden, and nothing derived from a negative prompt.
+const VISIBLE_TAGGING: &str = "i.hidden = 0 AND t.hidden = 0 AND it.source <> 'negative'";
+
+/// How many of the most-used tags the co-occurrence pass considers. The pair
+/// scan is quadratic in the tags per image, so the long tail — which never
+/// reaches the top of the result anyway — is cut before the self-join.
+const COOC_POOL: i64 = 120;
+
+/// Most-used tags over the visible library, same exclusions as autocomplete.
+pub fn tag_frequency(conn: &Connection, limit: i64) -> rusqlite::Result<Vec<TagSuggestion>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT t.name, t.category, COUNT(*) AS n
+         FROM image_tags it
+         JOIN tags t ON t.id = it.tag_id
+         JOIN images i ON i.id = it.image_id
+         WHERE {VISIBLE_TAGGING}
+         GROUP BY t.id ORDER BY n DESC, t.name LIMIT ?1"
+    ))?;
+    let rows = stmt
+        .query_map(params![limit], |r| {
+            Ok(TagSuggestion {
+                name: r.get(0)?,
+                category: r.get(1)?,
+                count: r.get(2)?,
+            })
+        })?
+        .collect();
+    rows
+}
+
+/// Tag pairs sharing an image, most frequent first. `a.tag_id < b.tag_id`
+/// keeps each unordered pair once.
+pub fn tag_cooccurrence(conn: &Connection, limit: i64) -> rusqlite::Result<Vec<TagPair>> {
+    let mut stmt = conn.prepare(&format!(
+        "WITH visible AS (
+           SELECT it.image_id, it.tag_id FROM image_tags it
+           JOIN tags t ON t.id = it.tag_id
+           JOIN images i ON i.id = it.image_id
+           WHERE {VISIBLE_TAGGING}
+         ),
+         pool AS (
+           SELECT image_id, tag_id FROM visible
+           WHERE tag_id IN (
+             SELECT tag_id FROM visible GROUP BY tag_id ORDER BY COUNT(*) DESC LIMIT ?2
+           )
+         )
+         SELECT ta.name, tb.name, COUNT(*) AS n
+         FROM pool a
+         JOIN pool b ON b.image_id = a.image_id AND a.tag_id < b.tag_id
+         JOIN tags ta ON ta.id = a.tag_id
+         JOIN tags tb ON tb.id = b.tag_id
+         GROUP BY a.tag_id, b.tag_id
+         ORDER BY n DESC, ta.name, tb.name LIMIT ?1"
+    ))?;
+    let rows = stmt
+        .query_map(params![limit, COOC_POOL], |r| {
+            Ok(TagPair {
+                a: r.get(0)?,
+                b: r.get(1)?,
+                count: r.get(2)?,
+            })
+        })?
+        .collect();
+    rows
+}
+
+/// Visible images per local calendar day over the last `days` days, oldest
+/// first. Only days that have images are returned — the caller fills the gaps.
+pub fn images_per_day(conn: &Connection, days: i64) -> rusqlite::Result<Vec<DayCount>> {
+    let since = format!("-{} days", days.clamp(1, 3650) - 1);
+    let mut stmt = conn.prepare(
+        "SELECT date(file_mtime, 'unixepoch', 'localtime') AS d, COUNT(*)
+         FROM images
+         WHERE hidden = 0 AND date(file_mtime, 'unixepoch', 'localtime') >= date('now', 'localtime', ?1)
+         GROUP BY d ORDER BY d",
+    )?;
+    let rows = stmt
+        .query_map(params![since], |r| {
+            Ok(DayCount {
+                day: r.get(0)?,
+                count: r.get(1)?,
+            })
+        })?
+        .collect();
+    rows
+}
+
+pub fn set_phash(conn: &Connection, id: i64, phash: i64) -> rusqlite::Result<()> {
+    conn.execute("UPDATE images SET phash = ?2 WHERE id = ?1", params![id, phash])?;
+    Ok(())
+}
+
 /// Remove images from the index (rows + thumbs are handled by caller for files).
 pub fn get_paths_for_ids(conn: &Connection, ids: &[i64]) -> rusqlite::Result<Vec<(i64, String)>> {
     let mut stmt = conn.prepare("SELECT id, path FROM images WHERE id = ?1")?;
@@ -656,4 +898,125 @@ pub fn delete_images(conn: &Connection, ids: &[i64]) -> rusqlite::Result<()> {
         stmt.execute(params![id])?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn groups_chain_transitively_and_skip_singletons() {
+        // 0b0000 – 0b0001 – 0b0011 chain within distance 1; 0b0011 is
+        // distance 2 from 0b0000 but still joins the group transitively.
+        // The far-away hash stays out entirely.
+        let hashes = [0b0000, 0b0001, 0b0011, 0x7AF0_F0F0_F0F0_F0F0_u64 as i64];
+        let groups = group_hashes(&hashes, 1);
+        assert_eq!(groups.len(), 1);
+        let mut members: Vec<usize> = groups[0].iter().map(|&(i, _)| i).collect();
+        members.sort();
+        assert_eq!(members, vec![0, 1, 2]);
+        // middle member touches both neighbors at distance 1
+        let dist_of = |idx: usize| groups[0].iter().find(|&&(i, _)| i == idx).unwrap().1;
+        assert_eq!(dist_of(1), 1);
+        assert_eq!(dist_of(0), 1);
+    }
+
+    #[test]
+    fn no_groups_when_nothing_close() {
+        let hashes = [0, 0x00FF_FF00_1234_5678_u64 as i64, -1];
+        assert!(group_hashes(&hashes, 4).is_empty());
+    }
+
+    /// Baseline + every migration, exactly like `open()` does on disk.
+    fn mem_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        migrate(&conn).unwrap();
+        conn
+    }
+
+    fn add_image(conn: &Connection, id: i64, mtime: i64, hidden: i64) {
+        conn.execute(
+            "INSERT INTO images(id, path, file_size, file_mtime, hidden)
+             VALUES (?1, ?2, 100, ?3, ?4)",
+            params![id, format!("D:\\g\\{id}.png"), mtime, hidden],
+        )
+        .unwrap();
+    }
+
+    fn tag_image(conn: &Connection, image_id: i64, name: &str, source: &str, hidden: i64) {
+        conn.execute(
+            "INSERT OR IGNORE INTO tags(name, category, hidden) VALUES (?1, 'general', ?2)",
+            params![name, hidden],
+        )
+        .unwrap();
+        let tag_id: i64 = conn
+            .query_row("SELECT id FROM tags WHERE name = ?1", params![name], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO image_tags(image_id, tag_id, source) VALUES (?1, ?2, ?3)",
+            params![image_id, tag_id, source],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn tag_frequency_counts_only_visible_and_unhidden() {
+        let conn = mem_db();
+        add_image(&conn, 1, 1_700_000_000, 0);
+        add_image(&conn, 2, 1_700_000_000, 0);
+        add_image(&conn, 3, 1_700_000_000, 1); // rejected — must not count
+        for id in [1, 2, 3] {
+            tag_image(&conn, id, "1girl", "base", 0);
+        }
+        tag_image(&conn, 1, "smile", "base", 0);
+        tag_image(&conn, 1, "masterpiece", "base", 1); // hidden tag
+        tag_image(&conn, 1, "bad hands", "negative", 0); // negative-prompt row
+
+        let freq = tag_frequency(&conn, 10).unwrap();
+        let names: Vec<(&str, i64)> = freq.iter().map(|t| (t.name.as_str(), t.count)).collect();
+        assert_eq!(names, vec![("1girl", 2), ("smile", 1)]);
+    }
+
+    #[test]
+    fn cooccurrence_pairs_each_combination_once() {
+        let conn = mem_db();
+        add_image(&conn, 1, 1_700_000_000, 0);
+        add_image(&conn, 2, 1_700_000_000, 0);
+        for id in [1, 2] {
+            tag_image(&conn, id, "1girl", "base", 0);
+            tag_image(&conn, id, "smile", "base", 0);
+        }
+        tag_image(&conn, 1, "blue hair", "base", 0);
+
+        let pairs = tag_cooccurrence(&conn, 10).unwrap();
+        assert_eq!(pairs.len(), 3);
+        let top = &pairs[0];
+        assert_eq!(top.count, 2);
+        assert_eq!(
+            [top.a.as_str(), top.b.as_str()].iter().copied().collect::<std::collections::HashSet<_>>(),
+            ["1girl", "smile"].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn images_per_day_buckets_by_local_day_and_window() {
+        let conn = mem_db();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        add_image(&conn, 1, now, 0);
+        add_image(&conn, 2, now, 0);
+        add_image(&conn, 3, now - 3 * 86_400, 0);
+        add_image(&conn, 4, now, 1); // rejected
+        add_image(&conn, 5, now - 400 * 86_400, 0); // outside the window
+
+        let rows = images_per_day(&conn, 90).unwrap();
+        let total: i64 = rows.iter().map(|r| r.count).sum();
+        assert_eq!(total, 3);
+        assert_eq!(rows.last().unwrap().count, 2);
+        // ascending by day, and the far-past image never shows up
+        assert!(rows.windows(2).all(|w| w[0].day < w[1].day));
+    }
 }

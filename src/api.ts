@@ -151,3 +151,58 @@ export const setTagHidden = (name: string, hidden: boolean) =>
   invoke<void>("set_tag_hidden", { name, hidden });
 export const listHiddenTags = () => invoke<TagSuggestion[]>("list_hidden_tags");
 export const folderTree = () => invoke<DirEntry[]>("folder_tree");
+
+// ── phase 3 ──
+export interface DupImage {
+  id: number;
+  path: string;
+  file_name: string;
+  width: number;
+  height: number;
+  file_size: number;
+  file_mtime: number;
+  seed: number | null;
+  rating: number;
+  favorite: boolean;
+  /** hamming distance to the closest other member of the group (0 = visual twin) */
+  distance: number;
+}
+
+export interface DupResult {
+  /** visible images not hashed yet (thumbnails still generating); nonzero
+   *  means groups may be incomplete — offer a refresh */
+  unhashed: number;
+  /** each group sorted likely-keeper-first (favorite, rating, file size);
+   *  groups sorted newest first */
+  groups: DupImage[][];
+}
+
+/** maxDistance: 0 = exact/re-encoded twins, ~6 = near-duplicates (default
+ *  suggestion), 10+ = loose. Emits no events; safe to re-run freely. */
+export const findDuplicates = (maxDistance: number) =>
+  invoke<DupResult>("find_duplicates", { maxDistance });
+
+export interface TagPair {
+  a: string;
+  b: string;
+  /** visible images carrying both tags */
+  count: number;
+}
+
+export interface DayCount {
+  /** local calendar day, ISO `YYYY-MM-DD` */
+  day: string;
+  count: number;
+}
+
+/** Top tags by visible-image count; hidden tags and negative-prompt rows
+ *  are excluded, as in autocomplete. */
+export const tagFrequency = (limit: number) =>
+  invoke<TagSuggestion[]>("tag_frequency", { limit });
+/** Top tag pairs sharing an image, computed over the most-used tags only. */
+export const tagCooccurrence = (limit: number) =>
+  invoke<TagPair[]>("tag_cooccurrence", { limit });
+/** Visible images per local calendar day; only days that have images come
+ *  back — the caller fills the gaps. */
+export const imagesPerDay = (days: number) =>
+  invoke<DayCount[]>("images_per_day", { days });

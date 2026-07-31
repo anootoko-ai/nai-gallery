@@ -2495,6 +2495,7 @@ dependencies = [
 name = "nai-gallery"
 version = "0.3.0"
 dependencies = [
+ "flate2",
  "image",
  "notify",
  "notify-debouncer-mini",
