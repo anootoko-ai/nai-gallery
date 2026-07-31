@@ -24,6 +24,7 @@ export interface TagDetail {
   name: string;
   category: string;
   source: string;
+  hidden: boolean;
 }
 
 export interface ImageDetail {
@@ -78,6 +79,8 @@ export interface Query {
   favorite?: boolean;
   min_rating?: number;
   folder_id?: number;
+  /** absolute directory prefix INCLUDING trailing separator, e.g. `D:\gallery\2026-07\` */
+  path_prefix?: string;
   album_id?: number;
   /** true = only images in at least one album; false = only images in no album */
   in_album?: boolean;
@@ -128,3 +131,23 @@ export const createSavedSearch = (name: string, queryJson: string) =>
 export const deleteSavedSearch = (id: number) =>
   invoke<void>("delete_saved_search", { id });
 export const trashImages = (ids: number[]) => invoke<number>("trash_images", { ids });
+
+// ── phase 2.5 ──
+export interface DirEntry {
+  folder_id: number;
+  /** directory relative to the watched root, "" for the root itself */
+  rel_dir: string;
+  /** images directly in this directory (not descendants) */
+  count: number;
+}
+
+/** Adds tag(s) with source='user'; input is comma-splittable and normalized
+ *  like a prompt. Returns the normalized tag names actually added. */
+export const addUserTag = (ids: number[], name: string) =>
+  invoke<string[]>("add_user_tag", { ids, name });
+export const removeUserTag = (ids: number[], name: string) =>
+  invoke<void>("remove_user_tag", { ids, name });
+export const setTagHidden = (name: string, hidden: boolean) =>
+  invoke<void>("set_tag_hidden", { name, hidden });
+export const listHiddenTags = () => invoke<TagSuggestion[]>("list_hidden_tags");
+export const folderTree = () => invoke<DirEntry[]>("folder_tree");

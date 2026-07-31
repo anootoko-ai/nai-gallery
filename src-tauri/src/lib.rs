@@ -196,6 +196,50 @@ fn delete_saved_search(db: State<Db>, id: i64) -> Result<(), String> {
     db::delete_saved_search(&conn, id).map_err(|e| e.to_string())
 }
 
+// ── phase 2.5: user tags, tag hiding, folder tree ────────────
+
+/// Add tag(s) to images. Input goes through the same normalization as
+/// prompts, so "My OC, cool outfit" adds two tags that merge with any
+/// prompt-derived spelling.
+#[tauri::command]
+fn add_user_tag(db: State<Db>, ids: Vec<i64>, name: String) -> Result<Vec<String>, String> {
+    let tags = nai::normalize_tags(&name, "user");
+    if tags.is_empty() {
+        return Err("empty tag".into());
+    }
+    let conn = db.0.lock().unwrap();
+    let mut added = Vec::new();
+    for tag in &tags {
+        db::add_user_tag(&conn, &ids, &tag.name).map_err(|e| e.to_string())?;
+        added.push(tag.name.clone());
+    }
+    Ok(added)
+}
+
+#[tauri::command]
+fn remove_user_tag(db: State<Db>, ids: Vec<i64>, name: String) -> Result<(), String> {
+    let conn = db.0.lock().unwrap();
+    db::remove_user_tag(&conn, &ids, &name).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_tag_hidden(db: State<Db>, name: String, hidden: bool) -> Result<(), String> {
+    let conn = db.0.lock().unwrap();
+    db::set_tag_hidden(&conn, &name, hidden).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn list_hidden_tags(db: State<Db>) -> Result<Vec<db::TagSuggestion>, String> {
+    let conn = db.0.lock().unwrap();
+    db::list_hidden_tags(&conn).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn folder_tree(db: State<Db>) -> Result<Vec<db::DirEntry>, String> {
+    let conn = db.0.lock().unwrap();
+    db::folder_tree(&conn).map_err(|e| e.to_string())
+}
+
 /// Move files to the OS recycle bin and drop them from the index.
 /// The ONLY file-modifying operation in the app; triggered explicitly by the user.
 #[tauri::command]
@@ -375,7 +419,12 @@ pub fn run() {
             list_saved_searches,
             create_saved_search,
             delete_saved_search,
-            trash_images
+            trash_images,
+            add_user_tag,
+            remove_user_tag,
+            set_tag_hidden,
+            list_hidden_tags,
+            folder_tree
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

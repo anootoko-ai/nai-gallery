@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { open as openDialog, confirm as confirmDialog } from "@tauri-apps/plugin-dialog";
 import { check, type Update } from "@tauri-apps/plugin-updater";
@@ -13,12 +13,23 @@ interface Filter {
 
 /// What the grid is showing. One value instead of parallel view/folder/album
 /// states that would have to be reset in lockstep.
+/// A folder scope optionally carries a subdirectory relative to the watched
+/// root — absent/"" means the whole root, as before.
 type Scope =
   | { kind: "all" }
   | { kind: "favorites" }
   | { kind: "rejects" }
-  | { kind: "folder"; id: number }
+  | { kind: "folder"; id: number; relDir?: string }
   | { kind: "album"; id: number };
+
+/// One directory in a watched root's subfolder tree. `count` is aggregate:
+/// images directly here plus everything below.
+interface DirNode {
+  relDir: string;
+  name: string;
+  count: number;
+  children: DirNode[];
+}
 
 /// "any" = no album filtering; "out" = only images in no album (the curation
 /// pool); "in" = only images already in at least one album.
@@ -45,8 +56,94 @@ interface Mods {
 
 const PAGE = 200;
 
+/// The boilerplate NovelAI ships in almost every prompt. Offered as a visible,
+/// one-click starting point for hiding — every entry stays listed (and
+/// un-hideable) in the sidebar's Hidden tags section afterwards.
+const QUALITY_TAGS = [
+  "masterpiece",
+  "best quality",
+  "amazing quality",
+  "very aesthetic",
+  "highres",
+  "absurdres",
+  "incredibly absurdres",
+  "no text",
+  "lowres",
+  "bad anatomy",
+  "bad hands",
+  "worst quality",
+  "low quality",
+  "normal quality",
+  "jpeg artifacts",
+  "signature",
+  "watermark",
+  "username",
+  "blurry",
+];
+
 const scopeId = (s: Scope) => ("id" in s ? s.id : null);
-const sameScope = (a: Scope, b: Scope) => a.kind === b.kind && scopeId(a) === scopeId(b);
+const scopeRel = (s: Scope) => (s.kind === "folder" ? s.relDir ?? "" : "");
+const sameScope = (a: Scope, b: Scope) =>
+  a.kind === b.kind && scopeId(a) === scopeId(b) && scopeRel(a) === scopeRel(b);
+
+const splitRel = (rel: string) => rel.split(/[\\/]+/).filter(Boolean);
+
+/// The separator the stored absolute paths actually use — Windows roots come
+/// back with backslashes, anything else with forward ones.
+const sepOf = (p: string) => (p.includes("\\") ? "\\" : "/");
+
+/// `root` + `relDir` as an absolute directory prefix with a trailing separator,
+/// the shape `Query.path_prefix` wants. Roots may or may not already end in one.
+const dirPrefix = (root: string, relDir: string) => {
+  const sep = sepOf(root);
+  const base = root.replace(/[\\/]+$/, "");
+  const rel = splitRel(relDir).join(sep);
+  return rel ? base + sep + rel + sep : base + sep;
+};
+
+const dirKey = (folderId: number, relDir: string) => `${folderId} ${relDir}`;
+
+const baseName = (p: string) => {
+  const parts = p.replace(/[\\/]+$/, "").split(/[\\/]/);
+  return parts[parts.length - 1] || p;
+};
+
+/// Flat `rel_dir` list → one nested tree per watched root. Directories that
+/// hold no images of their own still appear as nodes when a descendant does.
+function buildDirTrees(entries: api.DirEntry[]): Map<number, DirNode[]> {
+  const roots = new Map<number, DirNode[]>();
+  const nodes = new Map<string, DirNode>();
+
+  const ensure = (folderId: number, parts: string[]): DirNode => {
+    const relDir = parts.join("/");
+    const key = `${folderId}\u0000${relDir}`;
+    const hit = nodes.get(key);
+    if (hit) return hit;
+    const node: DirNode = { relDir, name: parts[parts.length - 1], count: 0, children: [] };
+    nodes.set(key, node);
+    if (parts.length === 1) {
+      const list = roots.get(folderId);
+      if (list) list.push(node);
+      else roots.set(folderId, [node]);
+    } else {
+      ensure(folderId, parts.slice(0, -1)).children.push(node);
+    }
+    return node;
+  };
+
+  for (const e of entries) {
+    const parts = splitRel(e.rel_dir);
+    // "" = images sitting directly in the root; the root row already counts those
+    for (let i = 1; i <= parts.length; i++) ensure(e.folder_id, parts.slice(0, i)).count += e.count;
+  }
+
+  const sortRec = (list: DirNode[]) => {
+    list.sort((a, b) => a.name.localeCompare(b.name));
+    for (const n of list) sortRec(n.children);
+  };
+  for (const list of roots.values()) sortRec(list);
+  return roots;
+}
 
 export default function App() {
   // ── query state ──
@@ -58,9 +155,11 @@ export default function App() {
   const [cards, setCards] = useState<api.ImageCard[]>([]);
   const [total, setTotal] = useState(0);
   const [folders, setFolders] = useState<api.FolderInfo[]>([]);
+  const [dirs, setDirs] = useState<api.DirEntry[]>([]);
   const [albums, setAlbums] = useState<api.AlbumInfo[]>([]);
   const [searches, setSearches] = useState<api.SavedSearch[]>([]);
   const [tops, setTops] = useState<api.TagSuggestion[]>([]);
+  const [hiddenTags, setHiddenTags] = useState<api.TagSuggestion[]>([]);
   const [stats, setStats] = useState<api.LibraryStats | null>(null);
   const [scanMsg, setScanMsg] = useState<string | null>(null);
   // ── selection / viewer ──
@@ -78,12 +177,31 @@ export default function App() {
 
   const selIds = useMemo(() => [...sel], [sel]);
 
+  const dirTrees = useMemo(() => buildDirTrees(dirs), [dirs]);
+
+  /// Set only for a subfolder scope; the root itself still filters by folder_id
+  /// alone. Undefined until `folders` has loaded — the query re-runs once the
+  /// root path is known.
+  const subPrefix = useMemo(() => {
+    if (scope.kind !== "folder" || !scope.relDir) return undefined;
+    const root = folders.find((f) => f.id === scope.id);
+    return root ? dirPrefix(root.path, scope.relDir) : undefined;
+  }, [scope, folders]);
+
+  const scopeLabel = useMemo(() => {
+    if (scope.kind !== "folder") return null;
+    const root = folders.find((f) => f.id === scope.id);
+    const head = root ? baseName(root.path) : "folder";
+    return scope.relDir ? [head, ...splitRel(scope.relDir)].join(" / ") : head;
+  }, [scope, folders]);
+
   const buildQuery = useCallback(
     (offset: number): Partial<api.Query> => ({
       include_tags: filters.filter((f) => !f.neg).map((f) => f.tag),
       exclude_tags: filters.filter((f) => f.neg).map((f) => f.tag),
       favorite: scope.kind === "favorites" ? true : undefined,
       folder_id: scope.kind === "folder" ? scope.id : undefined,
+      path_prefix: subPrefix,
       album_id: scope.kind === "album" ? scope.id : undefined,
       // meaningless inside an album view — every image there is in an album
       in_album:
@@ -93,14 +211,16 @@ export default function App() {
       offset,
       limit: PAGE,
     }),
-    [filters, scope, sort, albumFilter]
+    [filters, scope, sort, albumFilter, subPrefix]
   );
 
   const refreshMeta = useCallback(() => {
     api.listFolders().then(setFolders).catch(() => {});
+    api.folderTree().then(setDirs).catch(() => {});
     api.listAlbums().then(setAlbums).catch(() => {});
     api.listSavedSearches().then(setSearches).catch(() => {});
     api.topTags().then(setTops).catch(() => {});
+    api.listHiddenTags().then(setHiddenTags).catch(() => {});
     api.getStats().then(setStats).catch(() => {});
   }, []);
 
@@ -233,6 +353,18 @@ export default function App() {
     setDetail((d) => (d && hit.has(d.id) ? { ...d, ...patch } : d));
   }, []);
 
+  // re-read the primary image after something changed its tags
+  const refreshDetail = useCallback(() => {
+    if (primaryId == null) return;
+    api.getImage(primaryId).then(setDetail).catch(() => {});
+  }, [primaryId]);
+
+  // transient status-bar note; a live scan overwrites it on its next tick
+  const flash = useCallback((msg: string) => {
+    setScanMsg(msg);
+    setTimeout(() => setScanMsg((m) => (m === msg ? null : m)), 2600);
+  }, []);
+
   // ── actions ──
   const addFilter = useCallback((tag: string, neg: boolean) => {
     setFilters((f) =>
@@ -304,6 +436,45 @@ export default function App() {
     dropCards(selIds);
     api.listAlbums().then(setAlbums).catch(() => {});
   }, [scope, selIds, dropCards]);
+
+  const tagSelection = useCallback(() => {
+    const ids = selIds;
+    if (!ids.length) return;
+    setNamePrompt({
+      title: `Tag ${ids.length} image${ids.length === 1 ? "" : "s"}`,
+      placeholder: "Tag name — separate several with commas",
+      onSubmit: async (name) => {
+        const added = await api.addUserTag(ids, name);
+        flash(
+          added.length
+            ? `tagged ${ids.length} image${ids.length === 1 ? "" : "s"} · ${added.join(", ")}`
+            : "nothing to tag"
+        );
+        refreshDetail();
+        api.topTags().then(setTops).catch(() => {});
+      },
+    });
+  }, [selIds, flash, refreshDetail]);
+
+  /// Hiding is a property of the tag, not of any image: it drops the tag from
+  /// autocomplete and from Top tags (the backend filters those) and dims it in
+  /// the inspector. Always reversible from the sidebar's Hidden tags section.
+  const setTagsHidden = useCallback(
+    async (names: string[], hidden: boolean) => {
+      if (!names.length) return;
+      for (const n of names) await api.setTagHidden(n, hidden);
+      refreshDetail();
+      api.topTags().then(setTops).catch(() => {});
+      const list = await api.listHiddenTags().catch(() => [] as api.TagSuggestion[]);
+      setHiddenTags(list);
+      flash(
+        names.length === 1
+          ? `${hidden ? "hidden" : "unhidden"} ${names[0]}`
+          : `${list.length} tag${list.length === 1 ? "" : "s"} hidden`
+      );
+    },
+    [refreshDetail, flash]
+  );
 
   const promptNewAlbum = useCallback(
     (withSelection: boolean) => {
@@ -456,9 +627,12 @@ export default function App() {
         setScope={setScope}
         stats={stats}
         folders={folders}
+        dirTrees={dirTrees}
         albums={albums}
         searches={searches}
         tops={tops}
+        hiddenTags={hiddenTags}
+        onSetTagsHidden={setTagsHidden}
         onTag={(t) => addFilter(t, false)}
         onAddFolder={pickFolder}
         onRemoveFolder={async (id) => {
@@ -481,6 +655,7 @@ export default function App() {
         total={total}
         filters={filters}
         scope={scope}
+        scopeLabel={scopeLabel}
         albumFilter={albumFilter}
         sel={sel}
         primaryId={primaryId}
@@ -500,6 +675,8 @@ export default function App() {
         onTag={(t) => addFilter(t, false)}
         onFav={(id, current) => favorite([id], !current)}
         onRate={(id, n) => rate([id], n)}
+        onRefresh={refreshDetail}
+        onSetTagHidden={(name, hidden) => setTagsHidden([name], hidden)}
       />
       <StatusBar
         stats={stats}
@@ -522,6 +699,7 @@ export default function App() {
           onTrash={trashSelection}
           onAddToAlbum={addSelToAlbum}
           onNewAlbum={() => promptNewAlbum(true)}
+          onTag={tagSelection}
           onRemoveFromAlbum={removeSelFromAlbum}
         />
       )}
@@ -679,9 +857,12 @@ function Sidebar(props: {
   setScope: (s: Scope) => void;
   stats: api.LibraryStats | null;
   folders: api.FolderInfo[];
+  dirTrees: Map<number, DirNode[]>;
   albums: api.AlbumInfo[];
   searches: api.SavedSearch[];
   tops: api.TagSuggestion[];
+  hiddenTags: api.TagSuggestion[];
+  onSetTagsHidden: (names: string[], hidden: boolean) => void;
   onTag: (t: string) => void;
   onAddFolder: () => void;
   onRemoveFolder: (id: number) => void;
@@ -692,6 +873,16 @@ function Sidebar(props: {
   onDeleteSearch: (id: number) => void;
 }) {
   const is = (s: Scope) => sameScope(props.scope, s);
+  // expanded subfolder nodes, keyed like dirKey(); roots collapse by default
+  const [openDirs, setOpenDirs] = useState<Set<string>>(new Set());
+  const toggleDir = useCallback((key: string) => {
+    setOpenDirs((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }, []);
 
   return (
     <div className="sidebar">
@@ -773,30 +964,57 @@ function Sidebar(props: {
       {props.searches.length === 0 && <div className="side-empty">Search, then save it here</div>}
 
       <div className="side-h">Folders</div>
-      {props.folders.map((f) => (
-        <div
-          key={f.id}
-          className={`side-row ${is({ kind: "folder", id: f.id }) ? "active" : ""}`}
-          onClick={() =>
-            props.setScope(is({ kind: "folder", id: f.id }) ? { kind: "all" } : { kind: "folder", id: f.id })
-          }
-          title={f.path}
-        >
-          <span className="ico">▸</span>
-          <span className="name">{f.path}</span>
-          <span className="n">{f.image_count}</span>
-          <span
-            className="rm"
-            title="Remove from library (files stay on disk)"
-            onClick={(e) => {
-              e.stopPropagation();
-              props.onRemoveFolder(f.id);
-            }}
-          >
-            ✕
-          </span>
-        </div>
-      ))}
+      {props.folders.map((f) => {
+        const subs = props.dirTrees.get(f.id) ?? [];
+        const key = dirKey(f.id, "");
+        const open = openDirs.has(key);
+        return (
+          <Fragment key={f.id}>
+            <div
+              className={`side-row ${is({ kind: "folder", id: f.id }) ? "active" : ""}`}
+              onClick={() =>
+                props.setScope(is({ kind: "folder", id: f.id }) ? { kind: "all" } : { kind: "folder", id: f.id })
+              }
+              title={f.path}
+            >
+              <span
+                className={`ico ${subs.length ? "twisty" : ""}`}
+                title={subs.length ? (open ? "Collapse subfolders" : "Show subfolders") : undefined}
+                onClick={(e) => {
+                  if (!subs.length) return;
+                  e.stopPropagation();
+                  toggleDir(key);
+                }}
+              >
+                {subs.length > 0 && open ? "▾" : "▸"}
+              </span>
+              <span className="name">{f.path}</span>
+              <span className="n">{f.image_count}</span>
+              <span
+                className="rm"
+                title="Remove from library (files stay on disk)"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  props.onRemoveFolder(f.id);
+                }}
+              >
+                ✕
+              </span>
+            </div>
+            {open && (
+              <DirRows
+                folderId={f.id}
+                nodes={subs}
+                depth={1}
+                openDirs={openDirs}
+                onToggle={toggleDir}
+                scope={props.scope}
+                setScope={props.setScope}
+              />
+            )}
+          </Fragment>
+        );
+      })}
       <div className="side-row add" onClick={props.onAddFolder}>
         <span className="ico">＋</span>
         <span className="name">Add folder…</span>
@@ -809,7 +1027,141 @@ function Sidebar(props: {
           <span className="n">{t.count}</span>
         </div>
       ))}
+
+      <HiddenTags hidden={props.hiddenTags} onSetTagsHidden={props.onSetTagsHidden} />
     </div>
+  );
+}
+
+/// One level of a watched root's subfolder tree. Clicking a row scopes the grid
+/// to that directory and everything under it; the twisty only expands.
+function DirRows(props: {
+  folderId: number;
+  nodes: DirNode[];
+  depth: number;
+  openDirs: Set<string>;
+  onToggle: (key: string) => void;
+  scope: Scope;
+  setScope: (s: Scope) => void;
+}) {
+  return (
+    <>
+      {props.nodes.map((n) => {
+        const key = dirKey(props.folderId, n.relDir);
+        const open = props.openDirs.has(key);
+        const self: Scope = { kind: "folder", id: props.folderId, relDir: n.relDir };
+        const active = sameScope(props.scope, self);
+        return (
+          <Fragment key={key}>
+            <div
+              className={`side-row dir-row ${active ? "active" : ""}`}
+              style={{ paddingLeft: 14 + props.depth * 13 }}
+              title={n.relDir}
+              // clicking the active subfolder again falls back to the whole root
+              onClick={() => props.setScope(active ? { kind: "folder", id: props.folderId } : self)}
+            >
+              <span
+                className={`ico ${n.children.length ? "twisty" : "leaf"}`}
+                onClick={(e) => {
+                  if (!n.children.length) return;
+                  e.stopPropagation();
+                  props.onToggle(key);
+                }}
+              >
+                {n.children.length ? (open ? "▾" : "▸") : "·"}
+              </span>
+              <span className="name ltr">{n.name}</span>
+              <span className="n">{n.count}</span>
+            </div>
+            {open && n.children.length > 0 && (
+              <DirRows {...props} nodes={n.children} depth={props.depth + 1} />
+            )}
+          </Fragment>
+        );
+      })}
+    </>
+  );
+}
+
+/// Manage surface for tag hiding. Lives at the foot of the sidebar next to the
+/// other library-management sections (folders, albums), collapsed by default
+/// because it is only visited to undo something.
+function HiddenTags(props: {
+  hidden: api.TagSuggestion[];
+  onSetTagsHidden: (names: string[], hidden: boolean) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [suggest, setSuggest] = useState(false);
+
+  return (
+    <>
+      <div className="side-h">
+        Hidden tags
+        <span
+          className="h-act"
+          title={open ? "Collapse" : "Show and manage hidden tags"}
+          onClick={() => setOpen((o) => !o)}
+        >
+          {props.hidden.length > 0 && <span className="h-n">{props.hidden.length}</span>}
+          {open ? "▾" : "▸"}
+        </span>
+      </div>
+      {open && (
+        <>
+          {props.hidden.map((t) => (
+            <div key={t.name} className={`side-row tag-row t-${t.category}`} title={t.name}>
+              <span className="name">{t.name}</span>
+              <span className="n">{t.count}</span>
+              <span
+                className="un"
+                title="Unhide — show this tag in suggestions and tag lists again"
+                onClick={() => props.onSetTagsHidden([t.name], false)}
+              >
+                ↺
+              </span>
+            </div>
+          ))}
+          {props.hidden.length === 0 && (
+            <div className="side-empty">Nothing hidden — right-click a tag in the inspector to hide it</div>
+          )}
+          <div className="side-row add" onClick={() => setSuggest((s) => !s)}>
+            <span className="ico">✦</span>
+            <span className="name">Hide common quality tags…</span>
+          </div>
+          {suggest && (
+            <div className="hs-box">
+              <div className="hs-note">
+                These {QUALITY_TAGS.length} tags will be hidden from autocomplete and tag lists. Only
+                the ones your library actually uses will show up below afterwards — unhide any of
+                them here at any time.
+              </div>
+              <div className="hs-list">
+                {QUALITY_TAGS.map((n) => (
+                  <span key={n} className="hs-tag">
+                    {n}
+                  </span>
+                ))}
+              </div>
+              <div className="hs-actions">
+                <button className="copybtn" onClick={() => setSuggest(false)}>
+                  Cancel
+                </button>
+                <button
+                  className="copybtn accent"
+                  onClick={() => {
+                    props.onSetTagsHidden(QUALITY_TAGS, true);
+                    setSuggest(false);
+                    setOpen(true);
+                  }}
+                >
+                  Hide these
+                </button>
+              </div>
+            </div>
+          )}
+        </>
+      )}
+    </>
   );
 }
 
@@ -828,6 +1180,7 @@ function BulkBar(props: {
   onAddToAlbum: (id: number) => void;
   onNewAlbum: () => void;
   onRemoveFromAlbum: () => void;
+  onTag: () => void;
 }) {
   const [albumOpen, setAlbumOpen] = useState(false);
   const inRejects = props.scope.kind === "rejects";
@@ -854,6 +1207,10 @@ function BulkBar(props: {
       </button>
       <button className="bulk-btn" onClick={() => props.onFav(false)}>
         ♡ Unfavorite
+      </button>
+
+      <button className="bulk-btn" onClick={props.onTag} title="Add a user tag to the selection">
+        ＃ Tag…
       </button>
 
       <div className="bulk-album">
@@ -927,6 +1284,7 @@ function Grid(props: {
   total: number;
   filters: Filter[];
   scope: Scope;
+  scopeLabel: string | null;
   albumFilter: AlbumFilter;
   sel: Set<number>;
   primaryId: number | null;
@@ -982,6 +1340,7 @@ function Grid(props: {
       <div className="result-line">
         <b>{props.total}</b> image{props.total === 1 ? "" : "s"}
         {props.scope.kind === "rejects" && <> in Rejects</>}
+        {props.scopeLabel && <> in <b className="scope-label">{props.scopeLabel}</b></>}
         {props.scope.kind !== "album" && props.albumFilter === "out" && <> not yet in an album</>}
         {props.scope.kind !== "album" && props.albumFilter === "in" && <> already in an album</>}
         {props.filters.length > 0 && (
@@ -1058,11 +1417,151 @@ function Stars(props: { rating: number; onRate: (n: number) => void }) {
   );
 }
 
+/// The "+ tag" affordance at the end of the user-tag cloud. Collapsed until
+/// clicked; autocompletes against the tag database like the search bar does.
+function TagAdder(props: { onAdd: (value: string) => void }) {
+  const [editing, setEditing] = useState(false);
+  const [q, setQ] = useState("");
+  const [sugs, setSugs] = useState<api.TagSuggestion[]>([]);
+  const [open, setOpen] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (editing) inputRef.current?.focus();
+  }, [editing]);
+
+  useEffect(() => {
+    const v = q.trim();
+    // a comma-separated batch is committed verbatim — nothing to suggest for it
+    if (!v || v.includes(",")) {
+      setSugs([]);
+      setOpen(false);
+      return;
+    }
+    const t = setTimeout(() => {
+      api
+        .suggestTags(v)
+        .then((s) => {
+          setSugs(s);
+          setOpen(s.length > 0);
+        })
+        .catch(() => {});
+    }, 120);
+    return () => clearTimeout(t);
+  }, [q]);
+
+  const close = () => {
+    setEditing(false);
+    setQ("");
+    setSugs([]);
+    setOpen(false);
+  };
+
+  const commit = (value: string) => {
+    const v = value.trim();
+    if (v) props.onAdd(v);
+    close();
+  };
+
+  if (!editing)
+    return (
+      <span className="tag addtag" title="Add your own tag to this image" onClick={() => setEditing(true)}>
+        ＋ tag
+      </span>
+    );
+
+  return (
+    <span className="tag-add-wrap">
+      <input
+        ref={inputRef}
+        className="tag-add-input"
+        value={q}
+        placeholder="tag name"
+        onChange={(e) => setQ(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") commit(q);
+          else if (e.key === "Escape") close();
+        }}
+        onBlur={() => setTimeout(close, 150)}
+      />
+      {open && (
+        <div className="dropdown open tag-add-dd">
+          {sugs.map((s) => (
+            <div key={s.name} className="dd-row" onMouseDown={() => commit(s.name)}>
+              <span className={`t-${s.category}`}>{s.name}</span>
+              <span className="cnt">{s.count}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </span>
+  );
+}
+
+/// One inspector tag chip. Click searches for the tag; the hover affordance —
+/// also bound to right-click, since the whole chip is already a click target —
+/// hides or unhides it. A hidden tag stays listed here, only dimmed.
+function TagChip(props: {
+  tag: api.TagDetail;
+  onTag: (t: string) => void;
+  onSetHidden: (name: string, hidden: boolean) => void;
+  onRemove?: (name: string) => void;
+}) {
+  const t = props.tag;
+  const toggle = () => props.onSetHidden(t.name, !t.hidden);
+
+  return (
+    <span
+      className={`tag t-${t.category} ${props.onRemove ? "user" : ""} ${t.hidden ? "dimmed" : ""}`}
+      title={
+        t.hidden
+          ? "Hidden tag — click to search, right-click to unhide"
+          : "Click to search, right-click to hide"
+      }
+      onClick={() => props.onTag(t.name)}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        toggle();
+      }}
+    >
+      {t.name}
+      <span
+        className="hide"
+        title={
+          t.hidden
+            ? "Unhide — show in suggestions and tag lists again"
+            : "Hide this tag from suggestions and tag lists"
+        }
+        onClick={(e) => {
+          e.stopPropagation();
+          toggle();
+        }}
+      >
+        {t.hidden ? "↺" : "⊘"}
+      </span>
+      {props.onRemove && (
+        <span
+          className="x"
+          title="Remove this tag from the image"
+          onClick={(e) => {
+            e.stopPropagation();
+            props.onRemove!(t.name);
+          }}
+        >
+          ✕
+        </span>
+      )}
+    </span>
+  );
+}
+
 function Inspector(props: {
   detail: api.ImageDetail | null;
   onTag: (t: string) => void;
   onFav: (id: number, current: boolean) => void;
   onRate: (id: number, n: number) => void;
+  onRefresh: () => void;
+  onSetTagHidden: (name: string, hidden: boolean) => void;
 }) {
   const [showNeg, setShowNeg] = useState(false);
   const d = props.detail;
@@ -1076,7 +1575,17 @@ function Inspector(props: {
 
   const baseTags = d.tags.filter((t) => t.source === "base");
   const charTags = d.tags.filter((t) => t.source === "char");
+  const userTags = d.tags.filter((t) => t.source === "user");
   const date = new Date(d.file_mtime * 1000).toLocaleString();
+
+  const addUserTag = async (value: string) => {
+    await api.addUserTag([d.id], value);
+    props.onRefresh();
+  };
+  const removeUserTag = async (name: string) => {
+    await api.removeUserTag([d.id], name);
+    props.onRefresh();
+  };
 
   return (
     <div className="inspector">
@@ -1123,9 +1632,12 @@ function Inspector(props: {
                 <div className="insp-h">Prompt tags</div>
                 <div className="tagcloud">
                   {baseTags.map((t) => (
-                    <span key={t.name} className={`tag t-${t.category}`} onClick={() => props.onTag(t.name)}>
-                      {t.name}
-                    </span>
+                    <TagChip
+                      key={t.name}
+                      tag={t}
+                      onTag={props.onTag}
+                      onSetHidden={props.onSetTagHidden}
+                    />
                   ))}
                 </div>
               </>
@@ -1135,9 +1647,12 @@ function Inspector(props: {
                 <div className="insp-h">Character</div>
                 <div className="tagcloud">
                   {charTags.map((t) => (
-                    <span key={t.name} className={`tag t-${t.category}`} onClick={() => props.onTag(t.name)}>
-                      {t.name}
-                    </span>
+                    <TagChip
+                      key={t.name}
+                      tag={t}
+                      onTag={props.onTag}
+                      onSetHidden={props.onSetTagHidden}
+                    />
                   ))}
                 </div>
               </>
@@ -1165,6 +1680,20 @@ function Inspector(props: {
         ) : (
           <div className="insp-h">No NovelAI metadata</div>
         )}
+        {/* outside the NovelAI branch — anything in the library can be tagged */}
+        <div className="insp-h">Your tags</div>
+        <div className="tagcloud">
+          {userTags.map((t) => (
+            <TagChip
+              key={t.name}
+              tag={t}
+              onTag={props.onTag}
+              onSetHidden={props.onSetTagHidden}
+              onRemove={removeUserTag}
+            />
+          ))}
+          <TagAdder key={d.id} onAdd={addUserTag} />
+        </div>
       </div>
     </div>
   );

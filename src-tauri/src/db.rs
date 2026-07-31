@@ -61,12 +61,30 @@ CREATE TABLE IF NOT EXISTS saved_searches(
 );
 ";
 
+/// SCHEMA above is the frozen v0 baseline; all later changes are appended
+/// here and applied in order via PRAGMA user_version. Fresh databases get
+/// the baseline and then run every migration, so both paths converge.
+const MIGRATIONS: &[&str] = &[
+    // 1: per-user tag hiding (phase 2.5)
+    "ALTER TABLE tags ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0;",
+];
+
+fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    for (i, migration) in MIGRATIONS.iter().enumerate().skip(version as usize) {
+        conn.execute_batch(migration)?;
+        conn.pragma_update(None, "user_version", (i + 1) as i64)?;
+    }
+    Ok(())
+}
+
 pub fn open(app_data_dir: &Path) -> rusqlite::Result<Db> {
     std::fs::create_dir_all(app_data_dir).ok();
     let conn = Connection::open(app_data_dir.join("library.sqlite"))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.execute_batch(SCHEMA)?;
+    migrate(&conn)?;
     Ok(Db(Mutex::new(conn)))
 }
 
@@ -82,6 +100,9 @@ pub struct Query {
     pub favorite: Option<bool>,
     pub min_rating: Option<i64>,
     pub folder_id: Option<i64>,
+    /// Absolute directory prefix INCLUDING trailing separator, e.g.
+    /// `D:\gallery\2026-07\` — scopes to a subfolder of a watched root.
+    pub path_prefix: Option<String>,
     pub album_id: Option<i64>,
     /// Some(true) = only images in at least one album;
     /// Some(false) = only images in no album at all
@@ -128,6 +149,7 @@ pub struct TagDetail {
     pub name: String,
     pub category: String,
     pub source: String,
+    pub hidden: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -238,6 +260,13 @@ fn build_where(q: &Query, params_out: &mut Vec<Box<dyn rusqlite::ToSql>>) -> Str
     if let Some(f) = q.folder_id {
         clauses.push(format!("images.folder_id = {f}"));
     }
+    // exact prefix compare instead of LIKE: Windows paths routinely contain
+    // `_`, which LIKE would treat as a wildcard
+    if let Some(prefix) = q.path_prefix.as_ref().filter(|p| !p.is_empty()) {
+        clauses.push("substr(images.path, 1, length(?)) = ?".into());
+        params_out.push(Box::new(prefix.clone()));
+        params_out.push(Box::new(prefix.clone()));
+    }
     clauses.join(" AND ")
 }
 
@@ -284,7 +313,7 @@ pub fn suggest_tags(conn: &Connection, prefix: &str, limit: i64) -> rusqlite::Re
     let mut stmt = conn.prepare(
         "SELECT t.name, t.category, COUNT(it.image_id) AS n
          FROM tags t JOIN image_tags it ON it.tag_id = t.id
-         WHERE t.name LIKE ?1
+         WHERE t.name LIKE ?1 AND t.hidden = 0
          GROUP BY t.id ORDER BY n DESC, t.name LIMIT ?2",
     )?;
     let rows = stmt
@@ -338,7 +367,7 @@ pub fn get_image(conn: &Connection, id: i64) -> rusqlite::Result<ImageDetail> {
     )?;
     // artists first, then general, then character tags
     let mut stmt = conn.prepare(
-        "SELECT t.name, t.category, it.source FROM image_tags it
+        "SELECT t.name, t.category, it.source, t.hidden FROM image_tags it
          JOIN tags t ON t.id = it.tag_id WHERE it.image_id = ?1
          ORDER BY CASE t.category WHEN 'artist' THEN 0 WHEN 'general' THEN 1 ELSE 2 END, t.name",
     )?;
@@ -348,6 +377,7 @@ pub fn get_image(conn: &Connection, id: i64) -> rusqlite::Result<ImageDetail> {
                 name: r.get(0)?,
                 category: r.get(1)?,
                 source: r.get(2)?,
+                hidden: r.get::<_, i64>(3)? != 0,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -505,6 +535,107 @@ pub fn create_saved_search(conn: &Connection, name: &str, query_json: &str) -> r
 pub fn delete_saved_search(conn: &Connection, id: i64) -> rusqlite::Result<()> {
     conn.execute("DELETE FROM saved_searches WHERE id = ?1", params![id])?;
     Ok(())
+}
+
+// ── phase 2.5: user tags, tag hiding, folder tree ────────────
+
+/// Attach a tag to images with source='user'. The name must already be
+/// normalized (lowercased, whitespace collapsed) so it merges with
+/// prompt-derived tags. If the tag already exists on an image with a
+/// metadata source, that row is left untouched.
+pub fn add_user_tag(conn: &Connection, ids: &[i64], name: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO tags(name, category) VALUES (?1, 'general')",
+        params![name],
+    )?;
+    let tag_id: i64 =
+        conn.query_row("SELECT id FROM tags WHERE name = ?1", params![name], |r| r.get(0))?;
+    let mut stmt = conn.prepare(
+        "INSERT OR IGNORE INTO image_tags(image_id, tag_id, source) VALUES (?1, ?2, 'user')",
+    )?;
+    for id in ids {
+        stmt.execute(params![id, tag_id])?;
+    }
+    Ok(())
+}
+
+/// Only rows with source='user' are removable — prompt-derived tags would
+/// reappear on the next rescan anyway.
+pub fn remove_user_tag(conn: &Connection, ids: &[i64], name: &str) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare(
+        "DELETE FROM image_tags WHERE image_id = ?1 AND source = 'user'
+         AND tag_id = (SELECT id FROM tags WHERE name = ?2)",
+    )?;
+    for id in ids {
+        stmt.execute(params![id, name])?;
+    }
+    Ok(())
+}
+
+pub fn set_tag_hidden(conn: &Connection, name: &str, hidden: bool) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE tags SET hidden = ?2 WHERE name = ?1",
+        params![name, hidden as i64],
+    )?;
+    Ok(())
+}
+
+pub fn list_hidden_tags(conn: &Connection) -> rusqlite::Result<Vec<TagSuggestion>> {
+    let mut stmt = conn.prepare(
+        "SELECT t.name, t.category, COUNT(it.image_id) FROM tags t
+         LEFT JOIN image_tags it ON it.tag_id = t.id
+         WHERE t.hidden = 1 GROUP BY t.id ORDER BY t.name",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(TagSuggestion {
+                name: r.get(0)?,
+                category: r.get(1)?,
+                count: r.get(2)?,
+            })
+        })?
+        .collect();
+    rows
+}
+
+#[derive(Debug, Serialize)]
+pub struct DirEntry {
+    pub folder_id: i64,
+    /// Directory relative to the watched root, '' for the root itself.
+    /// Uses the OS separator as stored in images.path.
+    pub rel_dir: String,
+    /// Images directly in this directory (not descendants).
+    pub count: i64,
+}
+
+/// Directories under each watched root that contain at least one visible
+/// image, derived from images.path — the schema does not model subfolders.
+pub fn folder_tree(conn: &Connection) -> rusqlite::Result<Vec<DirEntry>> {
+    let mut stmt = conn.prepare(
+        "SELECT i.folder_id, f.path, i.path FROM images i
+         JOIN folders f ON f.id = i.folder_id WHERE i.hidden = 0",
+    )?;
+    let mut counts: std::collections::HashMap<(i64, String), i64> = std::collections::HashMap::new();
+    let rows = stmt.query_map([], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+    })?;
+    for row in rows {
+        let (folder_id, root, path) = row?;
+        let dir = Path::new(&path).parent().map(|p| p.to_string_lossy().into_owned());
+        let rel = match dir {
+            Some(d) if d.len() > root.len() && d.starts_with(&root) => {
+                d[root.len()..].trim_start_matches(['\\', '/']).to_string()
+            }
+            _ => String::new(),
+        };
+        *counts.entry((folder_id, rel)).or_insert(0) += 1;
+    }
+    let mut out: Vec<DirEntry> = counts
+        .into_iter()
+        .map(|((folder_id, rel_dir), count)| DirEntry { folder_id, rel_dir, count })
+        .collect();
+    out.sort_by(|a, b| (a.folder_id, &a.rel_dir).cmp(&(b.folder_id, &b.rel_dir)));
+    Ok(out)
 }
 
 /// Remove images from the index (rows + thumbs are handled by caller for files).

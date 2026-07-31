@@ -315,7 +315,11 @@ fn insert_image(conn: &rusqlite::Connection, folder_id: i64, f: &ParsedFile) -> 
         ],
     )?;
     let image_id: i64 = conn.query_row("SELECT id FROM images WHERE path = ?1", [&f.path], |r| r.get(0))?;
-    conn.execute("DELETE FROM image_tags WHERE image_id = ?1", [image_id])?;
+    // refresh metadata-derived tags only — user tags survive rescans
+    conn.execute(
+        "DELETE FROM image_tags WHERE image_id = ?1 AND source != 'user'",
+        [image_id],
+    )?;
     if let Some(m) = m {
         for tag in &m.tags {
             conn.execute(
