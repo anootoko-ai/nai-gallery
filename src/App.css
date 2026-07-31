@@ -88,6 +88,8 @@ body {
   padding: 5px 9px; background: var(--raised); border: 1px solid var(--border);
   border-radius: 6px; color: var(--dim); cursor: pointer; font: inherit;
 }
+.select:disabled { opacity: .45; cursor: default; }
+.select.filter-on { color: var(--accent); border-color: var(--accent-dim); }
 .zoom { display: flex; align-items: center; gap: 6px; color: var(--faint); }
 .zoom input { width: 80px; accent-color: var(--accent); }
 

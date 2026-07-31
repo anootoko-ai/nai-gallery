@@ -79,6 +79,8 @@ export interface Query {
   min_rating?: number;
   folder_id?: number;
   album_id?: number;
+  /** true = only images in at least one album; false = only images in no album */
+  in_album?: boolean;
   rejects?: boolean;
   sort: string;
   offset: number;

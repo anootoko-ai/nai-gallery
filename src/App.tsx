@@ -20,10 +20,15 @@ type Scope =
   | { kind: "folder"; id: number }
   | { kind: "album"; id: number };
 
+/// "any" = no album filtering; "out" = only images in no album (the curation
+/// pool); "in" = only images already in at least one album.
+type AlbumFilter = "any" | "out" | "in";
+
 interface SavedQuery {
   filters: Filter[];
   scope: Scope;
   sort: string;
+  albumFilter?: AlbumFilter;
 }
 
 interface NamePrompt {
@@ -48,6 +53,7 @@ export default function App() {
   const [filters, setFilters] = useState<Filter[]>([]);
   const [scope, setScope] = useState<Scope>({ kind: "all" });
   const [sort, setSort] = useState("newest");
+  const [albumFilter, setAlbumFilter] = useState<AlbumFilter>("any");
   // ── data state ──
   const [cards, setCards] = useState<api.ImageCard[]>([]);
   const [total, setTotal] = useState(0);
@@ -79,12 +85,15 @@ export default function App() {
       favorite: scope.kind === "favorites" ? true : undefined,
       folder_id: scope.kind === "folder" ? scope.id : undefined,
       album_id: scope.kind === "album" ? scope.id : undefined,
+      // meaningless inside an album view — every image there is in an album
+      in_album:
+        scope.kind === "album" || albumFilter === "any" ? undefined : albumFilter === "in",
       rejects: scope.kind === "rejects",
       sort,
       offset,
       limit: PAGE,
     }),
-    [filters, scope, sort]
+    [filters, scope, sort, albumFilter]
   );
 
   const refreshMeta = useCallback(() => {
@@ -123,7 +132,7 @@ export default function App() {
     setPrimaryId(null);
     anchorRef.current = null;
   }, []);
-  useEffect(clearSel, [scope, filters, sort, clearSel]);
+  useEffect(clearSel, [scope, filters, sort, albumFilter, clearSel]);
 
   // scan events
   useEffect(() => {
@@ -282,9 +291,11 @@ export default function App() {
       if (!selIds.length) return;
       await api.addToAlbum(albumId, selIds);
       api.listAlbums().then(setAlbums).catch(() => {});
-      if (scope.kind === "album" && scope.id === albumId) runQuery();
+      // curating with "not in an album" active: newly albumed images leave the pool
+      if (albumFilter === "out" && scope.kind !== "album") dropCards(selIds);
+      else if (scope.kind === "album" && scope.id === albumId) runQuery();
     },
-    [selIds, scope, runQuery]
+    [selIds, scope, albumFilter, dropCards, runQuery]
   );
 
   const removeSelFromAlbum = useCallback(async () => {
@@ -304,10 +315,11 @@ export default function App() {
           const id = await api.createAlbum(name);
           if (ids.length) await api.addToAlbum(id, ids);
           api.listAlbums().then(setAlbums).catch(() => {});
+          if (ids.length && albumFilter === "out" && scope.kind !== "album") dropCards(ids);
         },
       });
     },
-    [selIds]
+    [selIds, albumFilter, scope, dropCards]
   );
 
   const deleteAlbum = useCallback(
@@ -327,7 +339,7 @@ export default function App() {
   );
 
   const saveCurrentSearch = useCallback(() => {
-    const payload: SavedQuery = { filters, scope, sort };
+    const payload: SavedQuery = { filters, scope, sort, albumFilter };
     setNamePrompt({
       title: "Save current search",
       placeholder: "Name",
@@ -349,6 +361,7 @@ export default function App() {
     setFilters(Array.isArray(q.filters) ? q.filters : []);
     setScope(q.scope && typeof q.scope.kind === "string" ? q.scope : { kind: "all" });
     setSort(typeof q.sort === "string" ? q.sort : "newest");
+    setAlbumFilter(q.albumFilter === "in" || q.albumFilter === "out" ? q.albumFilter : "any");
   }, []);
 
   const pickFolder = async () => {
@@ -432,6 +445,9 @@ export default function App() {
         onRemove={removeFilter}
         sort={sort}
         setSort={setSort}
+        albumFilter={albumFilter}
+        setAlbumFilter={setAlbumFilter}
+        inAlbumScope={scope.kind === "album"}
         thumbWidth={thumbWidth}
         setThumbWidth={setThumbWidth}
       />
@@ -465,6 +481,7 @@ export default function App() {
         total={total}
         filters={filters}
         scope={scope}
+        albumFilter={albumFilter}
         sel={sel}
         primaryId={primaryId}
         onSelect={selectCard}
@@ -542,6 +559,9 @@ function TopBar(props: {
   onRemove: (i: number) => void;
   sort: string;
   setSort: (s: string) => void;
+  albumFilter: AlbumFilter;
+  setAlbumFilter: (f: AlbumFilter) => void;
+  inAlbumScope: boolean;
   thumbWidth: number;
   setThumbWidth: (n: number) => void;
 }) {
@@ -617,6 +637,21 @@ function TopBar(props: {
         )}
       </div>
       <div className="top-controls">
+        <select
+          className={`select ${props.albumFilter !== "any" ? "filter-on" : ""}`}
+          value={props.albumFilter}
+          disabled={props.inAlbumScope}
+          title={
+            props.inAlbumScope
+              ? "Not applicable while viewing an album"
+              : "Filter by album membership — “Not in an album” hides everything you've already sorted"
+          }
+          onChange={(e) => props.setAlbumFilter(e.target.value as AlbumFilter)}
+        >
+          <option value="any">Albums: all</option>
+          <option value="out">Not in an album</option>
+          <option value="in">In an album</option>
+        </select>
         <select className="select" value={props.sort} onChange={(e) => props.setSort(e.target.value)}>
           <option value="newest">Newest first</option>
           <option value="oldest">Oldest first</option>
@@ -892,6 +927,7 @@ function Grid(props: {
   total: number;
   filters: Filter[];
   scope: Scope;
+  albumFilter: AlbumFilter;
   sel: Set<number>;
   primaryId: number | null;
   onSelect: (id: number, mods: Mods) => void;
@@ -946,6 +982,8 @@ function Grid(props: {
       <div className="result-line">
         <b>{props.total}</b> image{props.total === 1 ? "" : "s"}
         {props.scope.kind === "rejects" && <> in Rejects</>}
+        {props.scope.kind !== "album" && props.albumFilter === "out" && <> not yet in an album</>}
+        {props.scope.kind !== "album" && props.albumFilter === "in" && <> already in an album</>}
         {props.filters.length > 0 && (
           <> matching {props.filters.map((f) => (f.neg ? "−" : "") + f.tag).join(" · ")}</>
         )}

@@ -83,6 +83,9 @@ pub struct Query {
     pub min_rating: Option<i64>,
     pub folder_id: Option<i64>,
     pub album_id: Option<i64>,
+    /// Some(true) = only images in at least one album;
+    /// Some(false) = only images in no album at all
+    pub in_album: Option<bool>,
     /// false (default) = hide rejects; true = show ONLY rejects
     #[serde(default)]
     pub rejects: bool,
@@ -191,6 +194,11 @@ fn build_where(q: &Query, params_out: &mut Vec<Box<dyn rusqlite::ToSql>>) -> Str
         clauses.push(format!(
             "images.id IN (SELECT image_id FROM album_images WHERE album_id = {a})"
         ));
+    }
+    match q.in_album {
+        Some(true) => clauses.push("images.id IN (SELECT image_id FROM album_images)".into()),
+        Some(false) => clauses.push("images.id NOT IN (SELECT image_id FROM album_images)".into()),
+        None => {}
     }
 
     if !q.include_tags.is_empty() {
